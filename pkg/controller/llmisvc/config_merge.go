@@ -162,11 +162,25 @@ func extendWithContext(llmSvc *v1alpha1.LLMInferenceService, extra []any) struct
 	if len(extra) > 0 {
 		extendedTemplateWithContext.Context = make(map[string]any)
 		for _, item := range extra {
-			typeName := reflect.TypeOf(item).String()
-			if strings.LastIndex(typeName, ".") > 0 {
-				typeName = typeName[strings.LastIndex(typeName, ".")+1:]
+			itemType := reflect.TypeOf(item)
+			itemValue := reflect.ValueOf(item)
+
+			name := itemType.Name()
+			// Promote fields of anonymous struct to top level of Context
+			if itemType.Kind() == reflect.Struct && name == "" && itemType.PkgPath() == "" {
+				for i := 0; i < itemType.NumField(); i++ {
+					field := itemType.Field(i)
+					fieldValue := itemValue.Field(i)
+					if field.IsExported() {
+						extendedTemplateWithContext.Context[field.Name] = fieldValue.Interface()
+					}
+				}
+			} else {
+				if strings.LastIndex(name, ".") > 0 {
+					name = name[strings.LastIndex(name, ".")+1:]
+				}
+				extendedTemplateWithContext.Context[name] = item
 			}
-			extendedTemplateWithContext.Context[typeName] = item
 		}
 	}
 	return extendedTemplateWithContext

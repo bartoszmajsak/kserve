@@ -875,6 +875,30 @@ spec:
 			},
 		},
 		{
+			name: "anonymous struct fields promoted to top level",
+			config: `apiVersion: serving.kserve.io/v1alpha1
+kind: LLMInferenceServiceConfig
+metadata:
+  name: test-config
+  namespace: "{{ .Context.SystemNamespace }}"
+spec:
+  model:
+    name: "{{ .Context.ModelName }}"`,
+			extra: []any{
+				struct {
+					SystemNamespace string
+					ModelName       string
+				}{
+					SystemNamespace: "kserve-system",
+					ModelName:       "llama-3.2-3b",
+				},
+			},
+			want: func(llmSvc *v1alpha1.LLMInferenceServiceConfig, g *GomegaWithT) {
+				g.Expect(llmSvc.Namespace).To(Equal("kserve-system"))
+				g.Expect(*llmSvc.Spec.Model.Name).To(Equal("llama-3.2-3b"))
+			},
+		},
+		{
 			name: "template with non-existing key should error",
 			config: `apiVersion: serving.kserve.io/v1alpha1
 kind: LLMInferenceServiceConfig
