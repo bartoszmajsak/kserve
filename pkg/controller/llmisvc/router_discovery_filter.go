@@ -20,26 +20,12 @@ import (
 	"net"
 	"strings"
 
+	"github.com/kserve/kserve/pkg/utils"
+
 	"knative.dev/pkg/network"
 
 	"knative.dev/pkg/apis"
 )
-
-type URLPredicateFn func(*apis.URL) bool
-
-func Filter(urls []*apis.URL, predicate URLPredicateFn) []*apis.URL {
-	if len(urls) == 0 {
-		return []*apis.URL{}
-	}
-
-	result := make([]*apis.URL, 0, len(urls))
-	for _, url := range urls {
-		if predicate(url) {
-			result = append(result, url)
-		}
-	}
-	return result
-}
 
 func IsInternalURL(url *apis.URL) bool {
 	host := url.Host
@@ -60,11 +46,11 @@ func IsExternalURL(url *apis.URL) bool {
 }
 
 func FilterInternalURLs(urls []*apis.URL) []*apis.URL {
-	return Filter(urls, IsInternalURL)
+	return utils.FilterSlice(urls, IsInternalURL)
 }
 
 func FilterExternalURLs(urls []*apis.URL) []*apis.URL {
-	return Filter(urls, IsExternalURL)
+	return utils.FilterSlice(urls, IsExternalURL)
 }
 
 func isInternalIP(addr string) bool {
