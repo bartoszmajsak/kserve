@@ -229,22 +229,6 @@ func GatewayRefWithoutNamespace(name string) gatewayapiv1.ParentReference {
 	}
 }
 
-func HTTPSGateway(name, namespace string, addresses ...string) *gatewayapiv1.Gateway {
-	return Gateway(name,
-		InNamespace[*gatewayapiv1.Gateway](namespace),
-		WithListener(gatewayapiv1.HTTPSProtocolType),
-		WithAddresses(addresses...),
-	)
-}
-
-func HTTPGateway(name, namespace string, addresses ...string) *gatewayapiv1.Gateway {
-	return Gateway(name,
-		InNamespace[*gatewayapiv1.Gateway](namespace),
-		WithListener(gatewayapiv1.HTTPProtocolType),
-		WithAddresses(addresses...),
-	)
-}
-
 type (
 	HTTPRouteRuleOption  func(*gatewayapiv1.HTTPRouteRule)
 	HTTPBackendRefOption func(*gatewayapiv1.HTTPBackendRef)

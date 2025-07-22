@@ -21,6 +21,7 @@ import (
 
 	. "github.com/onsi/gomega"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/utils/ptr"
 	"knative.dev/pkg/apis"
@@ -48,7 +49,12 @@ func TestDiscoverURLs(t *testing.T) {
 				InNamespace[*gatewayapi.HTTPRoute]("test-ns"),
 				WithParentRef(GatewayRef("test-gateway", RefInNamespace("test-ns"))),
 			),
-			gateway:      HTTPGateway("test-gateway", "test-ns", "203.0.113.1"),
+			gateway: Gateway("test-gateway",
+				InNamespace[*gatewayapi.Gateway]("test-ns"),
+				WithListener(gatewayapi.HTTPProtocolType),
+				WithClassName("test-gateway-class"),
+				WithAddresses("203.0.113.1"),
+			),
 			expectedURLs: []string{"http://203.0.113.1/"},
 		},
 		{
@@ -60,7 +66,8 @@ func TestDiscoverURLs(t *testing.T) {
 			gateway: Gateway("consistency-gateway",
 				InNamespace[*gatewayapi.Gateway]("test-ns"),
 				WithListener(gatewayapi.HTTPProtocolType),
-				WithAddresses([]string{"203.0.113.200", "203.0.113.100"}...),
+				WithClassName("test-gateway-class"),
+				WithAddresses("203.0.113.200", "203.0.113.100"),
 			),
 			expectedURLs: []string{
 				"http://203.0.113.100/",
@@ -76,6 +83,7 @@ func TestDiscoverURLs(t *testing.T) {
 			gateway: Gateway("mixed-gateway",
 				InNamespace[*gatewayapi.Gateway]("test-ns"),
 				WithListener(gatewayapi.HTTPProtocolType),
+				WithClassName("test-gateway-class"),
 				WithAddresses("192.168.1.10", "203.0.113.50", "10.0.0.20", "203.0.113.25"),
 			),
 			expectedURLs: []string{
@@ -95,7 +103,8 @@ func TestDiscoverURLs(t *testing.T) {
 			gateway: Gateway("hostname-gateway",
 				InNamespace[*gatewayapi.Gateway]("test-ns"),
 				WithListener(gatewayapi.HTTPProtocolType),
-				WithAddresses([]string{"203.0.113.1"}...),
+				WithClassName("test-gateway-class"),
+				WithAddresses("203.0.113.1"),
 			),
 			expectedURLs: []string{"http://api.example.com/"},
 		},
@@ -109,6 +118,7 @@ func TestDiscoverURLs(t *testing.T) {
 			gateway: Gateway("wildcard-gateway",
 				InNamespace[*gatewayapi.Gateway]("test-ns"),
 				WithListener(gatewayapi.HTTPProtocolType),
+				WithClassName("test-gateway-class"),
 				WithAddresses("203.0.113.100"),
 			),
 			expectedURLs: []string{"http://203.0.113.100/"},
@@ -123,6 +133,7 @@ func TestDiscoverURLs(t *testing.T) {
 			gateway: Gateway("multi-hostname-gateway",
 				InNamespace[*gatewayapi.Gateway]("test-ns"),
 				WithListener(gatewayapi.HTTPProtocolType),
+				WithClassName("test-gateway-class"),
 				WithAddresses("203.0.113.1"),
 			),
 			expectedURLs: []string{
@@ -140,6 +151,7 @@ func TestDiscoverURLs(t *testing.T) {
 			gateway: Gateway("path-gateway",
 				InNamespace[*gatewayapi.Gateway]("test-ns"),
 				WithListener(gatewayapi.HTTPProtocolType),
+				WithClassName("test-gateway-class"),
 				WithAddresses("203.0.113.1"),
 			),
 			expectedURLs: []string{"http://203.0.113.1/api/v1/models"},
@@ -150,7 +162,12 @@ func TestDiscoverURLs(t *testing.T) {
 				InNamespace[*gatewayapi.HTTPRoute]("test-ns"),
 				WithParentRef(GatewayRef("https-gateway", RefInNamespace("test-ns"))),
 			),
-			gateway:      HTTPSGateway("https-gateway", "test-ns", "203.0.113.1"),
+			gateway: Gateway("https-gateway",
+				InNamespace[*gatewayapi.Gateway]("test-ns"),
+				WithListener(gatewayapi.HTTPSProtocolType),
+				WithClassName("test-gateway-class"),
+				WithAddresses("203.0.113.1"),
+			),
 			expectedURLs: []string{"https://203.0.113.1/"},
 		},
 		{
@@ -166,7 +183,8 @@ func TestDiscoverURLs(t *testing.T) {
 			gateway: Gateway("a-gateway",
 				InNamespace[*gatewayapi.Gateway]("a-namespace"),
 				WithListener(gatewayapi.HTTPProtocolType),
-				WithAddresses([]string{"203.0.113.1"}...),
+				WithClassName("test-gateway-class"),
+				WithAddresses("203.0.113.1"),
 			),
 			additionalGateways: []*gatewayapi.Gateway{
 				Gateway("z-gateway",
@@ -176,6 +194,7 @@ func TestDiscoverURLs(t *testing.T) {
 				),
 				Gateway("b-gateway",
 					InNamespace[*gatewayapi.Gateway]("a-namespace"),
+					WithClassName("test-gateway-class"),
 					WithListener(gatewayapi.HTTPProtocolType),
 					WithAddresses("203.0.113.3"),
 				),
@@ -195,6 +214,7 @@ func TestDiscoverURLs(t *testing.T) {
 			gateway: Gateway("no-ns-gateway",
 				InNamespace[*gatewayapi.Gateway]("route-ns"),
 				WithListener(gatewayapi.HTTPProtocolType),
+				WithClassName("test-gateway-class"),
 				WithAddresses("203.0.113.1"),
 			),
 			expectedURLs: []string{"http://203.0.113.1/"},
@@ -208,6 +228,7 @@ func TestDiscoverURLs(t *testing.T) {
 			gateway: Gateway("no-external-addresses-gateway",
 				InNamespace[*gatewayapi.Gateway]("test-ns"),
 				WithListener(gatewayapi.HTTPProtocolType),
+				WithClassName("test-gateway-class"),
 				WithAddresses("192.168.1.10", "10.0.0.20"),
 			),
 			expectedURLs: []string{
@@ -233,6 +254,7 @@ func TestDiscoverURLs(t *testing.T) {
 			gateway: Gateway("empty-rules-gateway",
 				InNamespace[*gatewayapi.Gateway]("test-ns"),
 				WithListener(gatewayapi.HTTPProtocolType),
+				WithClassName("test-gateway-class"),
 				WithAddresses("203.0.113.1"),
 			),
 			expectedURLs: []string{"http://203.0.113.1/"},
@@ -247,6 +269,7 @@ func TestDiscoverURLs(t *testing.T) {
 			gateway: Gateway("hostname-gateway",
 				InNamespace[*gatewayapi.Gateway]("test-ns"),
 				WithListener(gatewayapi.HTTPProtocolType),
+				WithClassName("test-gateway-class"),
 				WithHostnameAddresses("api.example.com"),
 			),
 			expectedURLs: []string{"http://api.example.com/"},
@@ -260,6 +283,7 @@ func TestDiscoverURLs(t *testing.T) {
 			gateway: Gateway("mixed-types-gateway",
 				InNamespace[*gatewayapi.Gateway]("test-ns"),
 				WithListener(gatewayapi.HTTPProtocolType),
+				WithClassName("test-gateway-class"),
 				WithMixedAddresses(
 					HostnameAddress("z.example.com"),
 					IPAddress("203.0.113.1"),
@@ -283,6 +307,7 @@ func TestDiscoverURLs(t *testing.T) {
 			gateway: Gateway("internal-hostname-gateway",
 				InNamespace[*gatewayapi.Gateway]("test-ns"),
 				WithListener(gatewayapi.HTTPProtocolType),
+				WithClassName("test-gateway-class"),
 				WithMixedAddresses(
 					HostnameAddress("localhost"),
 					HostnameAddress("service.local"),
@@ -308,6 +333,7 @@ func TestDiscoverURLs(t *testing.T) {
 			gateway: Gateway("only-internal-gateway",
 				InNamespace[*gatewayapi.Gateway]("test-ns"),
 				WithListener(gatewayapi.HTTPProtocolType),
+				WithClassName("test-gateway-class"),
 				WithMixedAddresses(
 					IPAddress("192.168.1.10"),
 					IPAddress("10.0.0.20"),
@@ -330,6 +356,7 @@ func TestDiscoverURLs(t *testing.T) {
 			),
 			gateway: Gateway("nil-type-gateway",
 				InNamespace[*gatewayapi.Gateway]("test-ns"),
+				WithClassName("test-gateway-class"),
 				WithListener(gatewayapi.HTTPProtocolType),
 				WithAddresses("203.0.113.1", "192.168.1.10"),
 			),
@@ -346,6 +373,7 @@ func TestDiscoverURLs(t *testing.T) {
 			),
 			gateway: Gateway("no-addresses-gateway",
 				InNamespace[*gatewayapi.Gateway]("test-ns"),
+				WithClassName("test-gateway-class"),
 				WithListener(gatewayapi.HTTPProtocolType),
 			),
 			expectedErrorCheck: llmisvc.IsExternalAddressNotFound,
@@ -362,6 +390,7 @@ func TestDiscoverURLs(t *testing.T) {
 					Protocol: gatewayapi.HTTPProtocolType,
 					Port:     8080,
 				}),
+				WithClassName("test-gateway-class"),
 				WithAddresses("203.0.113.1"),
 			),
 			expectedURLs: []string{"http://203.0.113.1:8080/"},
@@ -375,6 +404,7 @@ func TestDiscoverURLs(t *testing.T) {
 			),
 			gateway: Gateway("custom-https-port-gateway",
 				InNamespace[*gatewayapi.Gateway]("test-ns"),
+				WithClassName("test-gateway-class"),
 				WithListeners(gatewayapi.Listener{
 					Protocol: gatewayapi.HTTPSProtocolType,
 					Port:     8443,
@@ -391,6 +421,7 @@ func TestDiscoverURLs(t *testing.T) {
 			),
 			gateway: Gateway("standard-http-gateway",
 				InNamespace[*gatewayapi.Gateway]("test-ns"),
+				WithClassName("test-gateway-class"),
 				WithListeners(gatewayapi.Listener{
 					Protocol: gatewayapi.HTTPProtocolType,
 					Port:     80,
@@ -408,6 +439,7 @@ func TestDiscoverURLs(t *testing.T) {
 			),
 			gateway: Gateway("standard-https-gateway",
 				InNamespace[*gatewayapi.Gateway]("test-ns"),
+				WithClassName("test-gateway-class"),
 				WithListeners(gatewayapi.Listener{
 					Protocol: gatewayapi.HTTPSProtocolType,
 					Port:     443,
@@ -431,6 +463,7 @@ func TestDiscoverURLs(t *testing.T) {
 			),
 			gateway: Gateway("multi-listener-gateway",
 				InNamespace[*gatewayapi.Gateway]("test-ns"),
+				WithClassName("test-gateway-class"),
 				WithListeners(
 					gatewayapi.Listener{
 						Name:     "http-listener",
@@ -456,6 +489,7 @@ func TestDiscoverURLs(t *testing.T) {
 			),
 			gateway: Gateway("comprehensive-gateway",
 				InNamespace[*gatewayapi.Gateway]("test-ns"),
+				WithClassName("test-gateway-class"),
 				WithListener(gatewayapi.HTTPProtocolType),
 				WithAddresses("203.0.113.1", "198.51.100.1"),
 			),
@@ -477,14 +511,33 @@ func TestDiscoverURLs(t *testing.T) {
 			g.Expect(err).ToNot(HaveOccurred())
 
 			var objects []client.Object
+			gatewayClasses := map[string]*gatewayapi.GatewayClass{}
 			if tt.gateway != nil {
+				name := string(tt.gateway.Spec.GatewayClassName)
+				gatewayClasses[name] = &gatewayapi.GatewayClass{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: name,
+					},
+					Spec: gatewayapi.GatewayClassSpec{},
+				}
 				objects = append(objects, tt.gateway)
 			}
 			if tt.route != nil {
 				objects = append(objects, tt.route)
 			}
 			for _, gw := range tt.additionalGateways {
+				name := string(gw.Spec.GatewayClassName)
+				gatewayClasses[name] = &gatewayapi.GatewayClass{
+					ObjectMeta: metav1.ObjectMeta{
+						Name: name,
+					},
+					Spec: gatewayapi.GatewayClassSpec{},
+				}
 				objects = append(objects, gw)
+			}
+
+			for _, gwClass := range gatewayClasses {
+				objects = append(objects, gwClass)
 			}
 
 			fakeClient := fake.NewClientBuilder().
