@@ -154,9 +154,10 @@ func (r *LLMInferenceServiceReconciler) reconcileSchedulerInferenceModel(ctx con
 
 func (r *LLMInferenceServiceReconciler) expectedSchedulerService(ctx context.Context, llmSvc *v1alpha1.LLMInferenceService) *corev1.Service {
 	logger := log.FromContext(ctx)
+
 	svc := &corev1.Service{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      llmSvc.Spec.Router.Scheduler.EPPServiceName(llmSvc),
+			Name:      llmSvc.EPPServiceName(),
 			Namespace: llmSvc.GetNamespace(),
 			Labels:    r.schedulerLabels(llmSvc),
 			OwnerReferences: []metav1.OwnerReference{
