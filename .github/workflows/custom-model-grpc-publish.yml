@@ -51,14 +51,12 @@ jobs:
           cache-binary: true
 
       - name: Run tests
-        uses: docker/build-push-action@v5
+        uses: docker/build-push-action@v6
         with:
           platforms: linux/amd64
           context: python
           file: python/custom_model_grpc.Dockerfile
           push: false
-          # https://github.com/docker/buildx/issues/1533
-          provenance: false
 
   # Push image to GitHub Packages.
   # See also https://docs.docker.com/docker-hub/builds/
@@ -111,6 +109,4 @@ jobs:
           file: python/custom_model_grpc.Dockerfile
           push: true
           tags: ${{ env.IMAGE_ID }}:${{ env.VERSION }}
-          # https://github.com/docker/buildx/issues/1533
-          provenance: false
           sbom: true

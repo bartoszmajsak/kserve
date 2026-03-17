@@ -68,6 +68,4 @@ jobs:
           file: ${{ matrix.image.path }}
           push: true
           tags: ${{ env.IMAGE_ID }}:${{ env.VERSION }} 
-          # https://github.com/docker/buildx/issues/1533
-          provenance: false
           sbom: true
