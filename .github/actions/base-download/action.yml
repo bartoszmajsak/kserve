@@ -1,17 +1,27 @@
 name: 'Base Download Actions'
-description: 'A wrapper around download docker artifact to download a set of base images'
+description: 'Downloads base KServe image artifacts and loads them into Docker'
+
+inputs:
+  images:
+    description: 'Space-separated list of image names to load (must match artifact contents)'
+    required: false
+    default: 'kserve-controller kserve-localmodel-controller kserve-localmodelnode-agent agent router storage-initializer'
 
 runs:
   using: "composite"
   steps:
-    - name: Download base artifacts
+    - name: Download base image artifacts
       uses: actions/download-artifact@v4
       with:
-        path: ./tmp
-        pattern: ${{ env.BASE_ARTIFACT_PREFIX }}-*
+        pattern: base-*
+        path: /tmp/images
         merge-multiple: true
 
     - name: Load base images
-      uses: ./.github/actions/load-docker-images
-      with:
-        directory: ./tmp
+      shell: bash
+      run: |
+        for img in ${{ inputs.images }}; do
+          docker load -i "/tmp/images/${img}.tar" &
+        done
+        wait
+        docker image ls

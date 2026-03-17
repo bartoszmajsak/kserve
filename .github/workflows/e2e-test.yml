@@ -12,29 +12,44 @@ on:
       - ".github/actions/**"
   workflow_dispatch:
 
+permissions:
+  contents: read
+  packages: write
+
 env:
   GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  GHCR_REPO: ghcr.io/${{ github.repository }}
   TAG: ${{ github.sha }}
-  DOCKER_IMAGES_PATH: "/mnt/docker-images"
   KO_DOCKER_REPO: "kserve"
-  # artifact prefixes for bulk download
-  PREDICTOR_ARTIFACT_PREFIX: "pred"
-  EXPLAINER_ARTIFACT_PREFIX: "exp"
-  TRANSFORMER_ARTIFACT_PREFIX: "trans"
-  GRAPH_ARTIFACT_PREFIX: "graph"
-  BASE_ARTIFACT_PREFIX: "base"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
+
+  # ---------------------------------------------------------------------------
+  # Detect changes — conditionally trigger helm or kustomize tests
+  # ---------------------------------------------------------------------------
+
   detect-changes:
     runs-on: ubuntu-latest
     outputs:
       install_methods: ${{ steps.set-matrix.outputs.install_methods }}
+      use_ghcr: ${{ steps.transport.outputs.use_ghcr }}
     steps:
       - uses: actions/checkout@v4
+      - name: Detect image transport mode
+        id: transport
+        run: |
+          # Use GHCR for push events and same-repo PRs (faster pulls).
+          # Fall back to GHA artifacts for fork PRs (no packages:write permission).
+          if [[ "${{ github.event_name }}" != "pull_request" ]] || \
+             [[ "${{ github.event.pull_request.head.repo.full_name }}" == "${{ github.repository }}" ]]; then
+            echo "use_ghcr=true" >> $GITHUB_OUTPUT
+          else
+            echo "use_ghcr=false" >> $GITHUB_OUTPUT
+          fi
       - name: Merge target branch
         if: github.event_name == 'pull_request'
         run: |
@@ -65,12 +80,27 @@ jobs:
             echo 'install_methods=["kustomize"]' >> $GITHUB_OUTPUT
           fi
 
+  # ---------------------------------------------------------------------------
+  # Build jobs — matrix + GHCR push
+  # ---------------------------------------------------------------------------
+
   kserve-image-build:
     runs-on: ubuntu-latest
+    needs: [detect-changes]
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix:
+        image:
+          - { name: kserve-controller, dockerfile: Dockerfile, context: "." }
+          - { name: kserve-localmodel-controller, dockerfile: localmodel.Dockerfile, context: "." }
+          - { name: kserve-localmodelnode-agent, dockerfile: localmodel-agent.Dockerfile, context: "." }
+          - { name: agent, dockerfile: agent.Dockerfile, context: "." }
+          - { name: router, dockerfile: router.Dockerfile, context: "." }
+          - { name: storage-initializer, dockerfile: python/storage-initializer.Dockerfile, context: python }
+          - { name: qpext, dockerfile: qpext/qpext.Dockerfile, context: "." }
     steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-
+      - uses: actions/checkout@v4
       - name: Merge target branch
         if: github.event_name == 'pull_request'
         run: |
@@ -79,80 +109,60 @@ jobs:
           git config user.email "ci@kserve.io"
           git config user.name "CI Bot"
           git merge --no-edit origin/${{ github.event.pull_request.base.ref }}
-
-      - name: Load KServe environment variables
-        run: ./kserve-images.sh --ci
-
-      - name: Free-up disk space
-        uses: ./.github/actions/free-up-disk-space
-
-      - name: Setup Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - uses: ./.github/actions/free-up-disk-space
+      - uses: docker/setup-buildx-action@v3
         with:
           cache-binary: true
-
-      - name: Build KServe images
-        run: |
-          sudo mkdir -p ${DOCKER_IMAGES_PATH}
-          sudo chown -R $USER ${DOCKER_IMAGES_PATH}
-          ./test/scripts/gh-actions/build-images.sh
-          docker image ls
-          sudo ls -lh ${DOCKER_IMAGES_PATH}
-
-      - name: Upload controller image
-        uses: actions/upload-artifact@v4
+      - name: Login to GHCR
+        if: needs.detect-changes.outputs.use_ghcr == 'true'
+        uses: docker/login-action@v3
         with:
-          name: ${{ env.BASE_ARTIFACT_PREFIX }}-${{ env.CONTROLLER_IMG }}-${{ env.TAG }}
-          path: ${{ env.DOCKER_IMAGES_PATH }}/${{ env.CONTROLLER_IMG }}-${{ env.TAG }}
-          compression-level: 0
-          if-no-files-found: error
-
-      - name: Upload localmodel controller image
-        uses: actions/upload-artifact@v4
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build ${{ matrix.image.name }}
+        uses: docker/build-push-action@v6
         with:
-          name: ${{ env.BASE_ARTIFACT_PREFIX }}-${{ env.LOCALMODEL_CONTROLLER_IMG }}-${{ env.TAG }}
-          path: ${{ env.DOCKER_IMAGES_PATH }}/${{ env.LOCALMODEL_CONTROLLER_IMG }}-${{ env.TAG }}
-          compression-level: 0
-          if-no-files-found: error
-
-      - name: Upload localmodel agent image
-        uses: actions/upload-artifact@v4
+          push: ${{ needs.detect-changes.outputs.use_ghcr == 'true' }}
+          load: ${{ needs.detect-changes.outputs.use_ghcr != 'true' }}
+          context: ${{ matrix.image.context }}
+          file: ${{ matrix.image.dockerfile }}
+          tags: >-
+            ${{ needs.detect-changes.outputs.use_ghcr == 'true'
+            && format('{0}/{1}:{2}', env.GHCR_REPO, matrix.image.name, github.sha)
+            || format('kserve/{0}:{1}', matrix.image.name, github.sha) }}
+          cache-from: type=gha,scope=${{ matrix.image.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.image.name }}
+      - name: Save and upload ${{ matrix.image.name }}
+        if: needs.detect-changes.outputs.use_ghcr != 'true'
+        run: docker save kserve/${{ matrix.image.name }}:${{ env.TAG }} -o /tmp/${{ matrix.image.name }}.tar
+      - uses: actions/upload-artifact@v4
+        if: needs.detect-changes.outputs.use_ghcr != 'true'
         with:
-          name: ${{ env.BASE_ARTIFACT_PREFIX }}-${{ env.LOCALMODEL_AGENT_IMG }}-${{ env.TAG }}
-          path: ${{ env.DOCKER_IMAGES_PATH }}/${{ env.LOCALMODEL_AGENT_IMG }}-${{ env.TAG }}
-          compression-level: 0
-          if-no-files-found: error
-
-      - name: Upload agent image
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.BASE_ARTIFACT_PREFIX }}-${{ env.AGENT_IMG }}-${{ env.TAG }}
-          path: ${{ env.DOCKER_IMAGES_PATH }}/${{ env.AGENT_IMG }}-${{ env.TAG }}
-          compression-level: 0
-          if-no-files-found: error
-
-      - name: Upload storage initializer image
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.BASE_ARTIFACT_PREFIX }}-${{ env.STORAGE_INIT_IMG }}-${{ env.TAG }}
-          path: ${{ env.DOCKER_IMAGES_PATH }}/${{ env.STORAGE_INIT_IMG }}-${{ env.TAG }}
-          compression-level: 0
-          if-no-files-found: error
-
-      - name: Upload router image
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.BASE_ARTIFACT_PREFIX }}-${{ env.ROUTER_IMG }}-${{ env.TAG }}
-          path: ${{ env.DOCKER_IMAGES_PATH }}/${{ env.ROUTER_IMG }}-${{ env.TAG }}
+          name: base-${{ matrix.image.name }}
+          path: /tmp/${{ matrix.image.name }}.tar
           compression-level: 0
           if-no-files-found: error
 
   predictor-runtime-build:
     runs-on: ubuntu-latest
+    needs: [detect-changes]
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        image:
+          - { name: sklearnserver, dockerfile: sklearn.Dockerfile, cache-mode: max }
+          - { name: xgbserver, dockerfile: xgb.Dockerfile, cache-mode: max }
+          - { name: lgbserver, dockerfile: lgb.Dockerfile, cache-mode: max }
+          - { name: pmmlserver, dockerfile: pmml.Dockerfile, cache-mode: min }
+          - { name: paddleserver, dockerfile: paddle.Dockerfile, cache-mode: min }
+          - { name: predictiveserver, dockerfile: predictiveserver.Dockerfile, cache-mode: min }
+          - { name: custom-model-grpc, dockerfile: custom_model_grpc.Dockerfile, cache-mode: min }
+          - { name: custom-image-transformer-grpc, dockerfile: custom_transformer_grpc.Dockerfile, cache-mode: min }
+          - { name: image-transformer, dockerfile: custom_transformer.Dockerfile, cache-mode: min }
     steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-
+      - uses: actions/checkout@v4
       - name: Merge target branch
         if: github.event_name == 'pull_request'
         run: |
@@ -161,112 +171,86 @@ jobs:
           git config user.email "ci@kserve.io"
           git config user.name "CI Bot"
           git merge --no-edit origin/${{ github.event.pull_request.base.ref }}
-
-      - name: Load KServe environment variables
-        run: ./kserve-images.sh --ci
-
-      - name: Free-up disk space
-        uses: ./.github/actions/free-up-disk-space
-
-      - name: Setup Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - uses: ./.github/actions/free-up-disk-space
+      - uses: docker/setup-buildx-action@v3
         with:
           cache-binary: true
-
-      - name: Build runtime server images
-        run: |
-          sudo mkdir -p ${DOCKER_IMAGES_PATH}
-          sudo chown -R $USER ${DOCKER_IMAGES_PATH}
-          ./test/scripts/gh-actions/build-server-runtimes.sh predictor,transformer
-          docker image ls
-          sudo ls -lh ${DOCKER_IMAGES_PATH}
-
-      - name: Upload sklearn artifact
-        uses: actions/upload-artifact@v4
+      - name: Login to GHCR
+        if: needs.detect-changes.outputs.use_ghcr == 'true'
+        uses: docker/login-action@v3
         with:
-          name: ${{ env.PREDICTOR_ARTIFACT_PREFIX }}-${{ env.SKLEARN_IMG }}-${{ env.TAG }}
-          path: ${{ env.DOCKER_IMAGES_PATH }}/${{ env.SKLEARN_IMG }}-${{ env.TAG }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build ${{ matrix.image.name }}
+        uses: docker/build-push-action@v6
+        with:
+          push: ${{ needs.detect-changes.outputs.use_ghcr == 'true' }}
+          load: ${{ needs.detect-changes.outputs.use_ghcr != 'true' }}
+          context: python
+          file: python/${{ matrix.image.dockerfile }}
+          tags: >-
+            ${{ needs.detect-changes.outputs.use_ghcr == 'true'
+            && format('{0}/{1}:{2}', env.GHCR_REPO, matrix.image.name, github.sha)
+            || format('kserve/{0}:{1}', matrix.image.name, github.sha) }}
+          cache-from: type=gha,scope=${{ matrix.image.name }}
+          cache-to: type=gha,mode=${{ matrix.image.cache-mode }},scope=${{ matrix.image.name }}
+      - name: Save and upload ${{ matrix.image.name }}
+        if: needs.detect-changes.outputs.use_ghcr != 'true'
+        run: docker save kserve/${{ matrix.image.name }}:${{ env.TAG }} -o /tmp/${{ matrix.image.name }}.tar
+      - uses: actions/upload-artifact@v4
+        if: needs.detect-changes.outputs.use_ghcr != 'true'
+        with:
+          name: runtime-${{ matrix.image.name }}
+          path: /tmp/${{ matrix.image.name }}.tar
           compression-level: 0
           if-no-files-found: error
 
-      - name: Upload xgb server image
-        uses: actions/upload-artifact@v4
+  huggingfaceserver-build:
+    runs-on: ubuntu-latest
+    needs: [detect-changes]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/free-up-disk-space
+      - uses: docker/setup-buildx-action@v3
         with:
-          name: ${{ env.PREDICTOR_ARTIFACT_PREFIX }}-${{ env.XGB_IMG }}-${{ env.TAG }}
-          path: ${{ env.DOCKER_IMAGES_PATH }}/${{ env.XGB_IMG }}-${{ env.TAG }}
-          compression-level: 0
-          if-no-files-found: error
-
-      - name: Upload lgb server image
-        uses: actions/upload-artifact@v4
+          cache-binary: true
+      - name: Login to GHCR
+        if: needs.detect-changes.outputs.use_ghcr == 'true'
+        uses: docker/login-action@v3
         with:
-          name: ${{ env.PREDICTOR_ARTIFACT_PREFIX }}-${{ env.LGB_IMG }}-${{ env.TAG }}
-          path: ${{ env.DOCKER_IMAGES_PATH }}/${{ env.LGB_IMG }}-${{ env.TAG }}
-          compression-level: 0
-          if-no-files-found: error
-
-      - name: Upload pmml server image
-        uses: actions/upload-artifact@v4
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build huggingfaceserver
+        uses: docker/build-push-action@v6
         with:
-          name: ${{ env.PREDICTOR_ARTIFACT_PREFIX }}-${{ env.PMML_IMG }}-${{ env.TAG }}
-          path: ${{ env.DOCKER_IMAGES_PATH }}/${{ env.PMML_IMG }}-${{ env.TAG }}
-          compression-level: 0
-          if-no-files-found: error
-
-      - name: Upload paddle image
-        uses: actions/upload-artifact@v4
+          push: ${{ needs.detect-changes.outputs.use_ghcr == 'true' }}
+          load: ${{ needs.detect-changes.outputs.use_ghcr != 'true' }}
+          context: python
+          file: python/huggingface_server_cpu.Dockerfile
+          tags: >-
+            ${{ needs.detect-changes.outputs.use_ghcr == 'true'
+            && format('{0}/huggingfaceserver:{1}', env.GHCR_REPO, github.sha)
+            || format('kserve/huggingfaceserver:{0}', github.sha) }}
+          cache-from: type=gha,scope=huggingfaceserver
+          cache-to: type=gha,mode=min,scope=huggingfaceserver
+      - name: Save and upload huggingfaceserver
+        if: needs.detect-changes.outputs.use_ghcr != 'true'
+        run: docker save kserve/huggingfaceserver:${{ env.TAG }} -o /tmp/huggingfaceserver.tar
+      - uses: actions/upload-artifact@v4
+        if: needs.detect-changes.outputs.use_ghcr != 'true'
         with:
-          name: ${{ env.PREDICTOR_ARTIFACT_PREFIX }}-${{ env.PADDLE_IMG }}-${{ env.TAG }}
-          path: ${{ env.DOCKER_IMAGES_PATH }}/${{ env.PADDLE_IMG }}-${{ env.TAG }}
-          compression-level: 0
-          if-no-files-found: error
-
-      - name: Upload predictiveserver image
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.PREDICTOR_ARTIFACT_PREFIX }}-${{ env.PREDICTIVE_IMG }}-${{ env.TAG }}
-          path: ${{ env.DOCKER_IMAGES_PATH }}/${{ env.PREDICTIVE_IMG }}-${{ env.TAG }}
-          compression-level: 0
-          if-no-files-found: error
-
-      - name: Upload image transformer image
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.TRANSFORMER_ARTIFACT_PREFIX }}-${{ env.IMAGE_TRANSFORMER_IMG }}-${{ env.TAG }}
-          path: ${{ env.DOCKER_IMAGES_PATH }}/${{ env.IMAGE_TRANSFORMER_IMG }}-${{ env.TAG }}
-          compression-level: 0
-          if-no-files-found: error
-
-      - name: Upload custom model grpc image
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.PREDICTOR_ARTIFACT_PREFIX }}-${{ env.CUSTOM_MODEL_GRPC_IMG }}-${{ env.TAG }}
-          path: ${{ env.DOCKER_IMAGES_PATH }}/${{ env.CUSTOM_MODEL_GRPC_IMG }}-${{ env.TAG }}
-          compression-level: 0
-          if-no-files-found: error
-
-      - name: Upload custom model transformer grpc image
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.TRANSFORMER_ARTIFACT_PREFIX }}-${{ env.CUSTOM_TRANSFORMER_GRPC_IMG }}-${{ env.TAG }}
-          path: ${{ env.DOCKER_IMAGES_PATH }}/${{ env.CUSTOM_TRANSFORMER_GRPC_IMG }}-${{ env.TAG }}
-          compression-level: 0
-          if-no-files-found: error
-
-      - name: Upload huggingface image
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.HUGGINGFACE_IMG }}-${{ env.TAG }}
-          path: ${{ env.DOCKER_IMAGES_PATH }}/${{ env.HUGGINGFACE_IMG }}-${{ env.TAG }}
+          name: runtime-huggingfaceserver
+          path: /tmp/huggingfaceserver.tar
           compression-level: 0
           if-no-files-found: error
 
   explainer-runtime-build:
     runs-on: ubuntu-latest
+    needs: [detect-changes]
     steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-
+      - uses: actions/checkout@v4
       - name: Merge target branch
         if: github.event_name == 'pull_request'
         run: |
@@ -275,37 +259,51 @@ jobs:
           git config user.email "ci@kserve.io"
           git config user.name "CI Bot"
           git merge --no-edit origin/${{ github.event.pull_request.base.ref }}
-
-      - name: Load KServe environment variables
-        run: ./kserve-images.sh --ci
-
-      - name: Setup Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v3
         with:
           cache-binary: true
-
-      - name: Build runtime server images
-        run: |
-          sudo mkdir -p ${DOCKER_IMAGES_PATH}
-          sudo chown -R $USER ${DOCKER_IMAGES_PATH}
-          ./test/scripts/gh-actions/build-server-runtimes.sh explainer
-          docker image ls
-          sudo ls -lh ${DOCKER_IMAGES_PATH}
-
-      - name: Upload art explainer image
-        uses: actions/upload-artifact@v4
+      - name: Login to GHCR
+        if: needs.detect-changes.outputs.use_ghcr == 'true'
+        uses: docker/login-action@v3
         with:
-          name: ${{ env.EXPLAINER_ARTIFACT_PREFIX }}-${{ env.ART_IMG }}-${{ env.TAG }}
-          path: ${{ env.DOCKER_IMAGES_PATH }}/${{ env.ART_IMG }}-${{ env.TAG }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build art-explainer
+        uses: docker/build-push-action@v6
+        with:
+          push: ${{ needs.detect-changes.outputs.use_ghcr == 'true' }}
+          load: ${{ needs.detect-changes.outputs.use_ghcr != 'true' }}
+          context: python
+          file: python/artexplainer.Dockerfile
+          tags: >-
+            ${{ needs.detect-changes.outputs.use_ghcr == 'true'
+            && format('{0}/art-explainer:{1}', env.GHCR_REPO, github.sha)
+            || format('kserve/art-explainer:{0}', github.sha) }}
+          cache-from: type=gha,scope=art-explainer
+          cache-to: type=gha,mode=min,scope=art-explainer
+      - name: Save and upload art-explainer
+        if: needs.detect-changes.outputs.use_ghcr != 'true'
+        run: docker save kserve/art-explainer:${{ env.TAG }} -o /tmp/art-explainer.tar
+      - uses: actions/upload-artifact@v4
+        if: needs.detect-changes.outputs.use_ghcr != 'true'
+        with:
+          name: runtime-art-explainer
+          path: /tmp/art-explainer.tar
           compression-level: 0
           if-no-files-found: error
 
   graph-tests-images-build:
     runs-on: ubuntu-latest
+    needs: [detect-changes]
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - { name: success-200-isvc, dockerfile: success_200_isvc.Dockerfile }
+          - { name: error-404-isvc, dockerfile: error_404_isvc.Dockerfile }
     steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-
+      - uses: actions/checkout@v4
       - name: Merge target branch
         if: github.event_name == 'pull_request'
         run: |
@@ -314,101 +312,61 @@ jobs:
           git config user.email "ci@kserve.io"
           git config user.name "CI Bot"
           git merge --no-edit origin/${{ github.event.pull_request.base.ref }}
-
-      - name: Load KServe environment variables
-        run: ./kserve-images.sh --ci
-
-      - name: Free-up disk space
-        uses: ./.github/actions/free-up-disk-space
-
-      - name: Setup Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - uses: ./.github/actions/free-up-disk-space
+      - uses: docker/setup-buildx-action@v3
         with:
           cache-binary: true
-
-      - name: Build test images needed for graph tests
-        run: |
-          sudo mkdir -p ${DOCKER_IMAGES_PATH}
-          sudo chown -R $USER ${DOCKER_IMAGES_PATH}
-          ./test/scripts/gh-actions/build-graph-tests-images.sh
-          docker image ls
-          sudo ls -lh ${DOCKER_IMAGES_PATH}
-
-      - name: Upload success_200_isvc predictor image
-        uses: actions/upload-artifact@v4
+      - name: Login to GHCR
+        if: needs.detect-changes.outputs.use_ghcr == 'true'
+        uses: docker/login-action@v3
         with:
-          name: ${{ env.GRAPH_ARTIFACT_PREFIX }}-${{ env.SUCCESS_200_ISVC_IMG }}-${{ env.TAG }}
-          path: ${{ env.DOCKER_IMAGES_PATH }}/${{ env.SUCCESS_200_ISVC_IMG }}-${{ env.TAG }}
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Build ${{ matrix.image.name }}
+        uses: docker/build-push-action@v6
+        with:
+          push: ${{ needs.detect-changes.outputs.use_ghcr == 'true' }}
+          load: ${{ needs.detect-changes.outputs.use_ghcr != 'true' }}
+          context: python
+          file: python/${{ matrix.image.dockerfile }}
+          tags: >-
+            ${{ needs.detect-changes.outputs.use_ghcr == 'true'
+            && format('{0}/{1}:{2}', env.GHCR_REPO, matrix.image.name, github.sha)
+            || format('kserve/{0}:{1}', matrix.image.name, github.sha) }}
+          cache-from: type=gha,scope=${{ matrix.image.name }}
+          cache-to: type=gha,mode=min,scope=${{ matrix.image.name }}
+      - name: Save and upload ${{ matrix.image.name }}
+        if: needs.detect-changes.outputs.use_ghcr != 'true'
+        run: docker save kserve/${{ matrix.image.name }}:${{ env.TAG }} -o /tmp/${{ matrix.image.name }}.tar
+      - uses: actions/upload-artifact@v4
+        if: needs.detect-changes.outputs.use_ghcr != 'true'
+        with:
+          name: graph-${{ matrix.image.name }}
+          path: /tmp/${{ matrix.image.name }}.tar
           compression-level: 0
           if-no-files-found: error
 
-      - name: Upload error_404_isvc predictor image
-        uses: actions/upload-artifact@v4
-        with:
-          name: ${{ env.GRAPH_ARTIFACT_PREFIX }}-${{ env.ERROR_404_ISVC_IMG }}-${{ env.TAG }}
-          path: ${{ env.DOCKER_IMAGES_PATH }}/${{ env.ERROR_404_ISVC_IMG }}-${{ env.TAG }}
-          compression-level: 0
-          if-no-files-found: error
+  # ---------------------------------------------------------------------------
+  # Test jobs
+  # ---------------------------------------------------------------------------
 
   test-predictor:
     runs-on: ubuntu-latest
-    needs: [detect-changes, kserve-image-build, predictor-runtime-build]
+    needs: [detect-changes, kserve-image-build, predictor-runtime-build, huggingfaceserver-build]
     strategy:
       fail-fast: false
       matrix:
         install-method: ${{ fromJSON(needs.detect-changes.outputs.install_methods) }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/e2e-test-setup
 
-      - name: Merge target branch
-        if: github.event_name == 'pull_request'
-        run: |
-          git fetch --unshallow origin
-          git fetch origin ${{ github.event.pull_request.base.ref }}
-          git config user.email "ci@kserve.io"
-          git config user.name "CI Bot"
-          git merge --no-edit origin/${{ github.event.pull_request.base.ref }}
-
-      - name: Load KServe environment variables
-        run: ./kserve-images.sh --ci
-
-      - name: Free-up disk space
-        uses: ./.github/actions/free-up-disk-space
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
+      - name: Load test images
+        uses: ./.github/actions/load-test-images
         with:
-          go-version-file: go.mod
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
-
-      - name: Setup Minikube
-        uses: ./.github/actions/minikube-setup
-
-      - name: KServe dependency setup
-        uses: ./.github/actions/kserve-dep-setup
-
-      - name: Download base images
-        uses: ./.github/actions/base-download
-
-      - name: Download predictor artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: ./tmp
-          pattern: ${{ env.PREDICTOR_ARTIFACT_PREFIX }}-*
-          merge-multiple: true
-
-      - name: Load docker images
-        uses: ./.github/actions/load-docker-images
-        with:
-          directory: ./tmp
-
-      - name: Install UV
-        run: ./test/scripts/gh-actions/setup-uv.sh
+          transport: ${{ needs.detect-changes.outputs.use_ghcr == 'true' && 'ghcr' || 'artifact' }}
+          images: 'kserve-controller kserve-localmodel-controller kserve-localmodelnode-agent agent router storage-initializer sklearnserver xgbserver lgbserver pmmlserver paddleserver predictiveserver custom-model-grpc custom-image-transformer-grpc huggingfaceserver image-transformer'
 
       - name: Install KServe
         run: |
@@ -422,14 +380,14 @@ jobs:
       - name: Run predictor E2E tests
         timeout-minutes: 40
         run: |
-          ./test/scripts/gh-actions/run-e2e-tests.sh "predictor" "6"
+          ./test/scripts/gh-actions/run-e2e-tests.sh "predictor" "8"
 
       - name: Check system status
         if: always()
         run: |
           ./test/scripts/gh-actions/status-check.sh
 
-  test-transformer-explainer-mms:
+  test-transformer-mms:
     runs-on: ubuntu-latest
     needs:
       [detect-changes, kserve-image-build, predictor-runtime-build, explainer-runtime-build]
@@ -438,81 +396,14 @@ jobs:
       matrix:
         install-method: ${{ fromJSON(needs.detect-changes.outputs.install_methods) }}
     steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/e2e-test-setup
 
-      - name: Merge target branch
-        if: github.event_name == 'pull_request'
-        run: |
-          git fetch --unshallow origin
-          git fetch origin ${{ github.event.pull_request.base.ref }}
-          git config user.email "ci@kserve.io"
-          git config user.name "CI Bot"
-          git merge --no-edit origin/${{ github.event.pull_request.base.ref }}
-
-      - name: Load KServe environment variables
-        run: ./kserve-images.sh --ci
-
-      - name: Free-up disk space
-        uses: ./.github/actions/free-up-disk-space
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
+      - name: Load test images
+        uses: ./.github/actions/load-test-images
         with:
-          go-version-file: go.mod
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
-
-      - name: Setup Minikube
-        uses: ./.github/actions/minikube-setup
-
-      - name: KServe dependency setup
-        uses: ./.github/actions/kserve-dep-setup
-
-      - name: Download base images
-        uses: ./.github/actions/base-download
-
-      - name: Download transformer and explainer artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: ./tmp
-          pattern: +(${{ env.TRANSFORMER_ARTIFACT_PREFIX }}|${{ env.EXPLAINER_ARTIFACT_PREFIX }})-*
-          merge-multiple: true
-
-      - name: Download sklearn server image
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ env.PREDICTOR_ARTIFACT_PREFIX }}-${{ env.SKLEARN_IMG }}-${{ env.TAG }}
-          path: ./tmp
-
-      - name: Download custom model grpc image
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ env.PREDICTOR_ARTIFACT_PREFIX }}-${{ env.CUSTOM_MODEL_GRPC_IMG }}-${{ env.TAG }}
-          path: ./tmp
-
-      - name: Download xgb server image
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ env.PREDICTOR_ARTIFACT_PREFIX }}-${{ env.XGB_IMG }}-${{ env.TAG }}
-          path: ./tmp
-
-      - name: Download predictiveserver image
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ env.PREDICTOR_ARTIFACT_PREFIX }}-${{ env.PREDICTIVE_IMG }}-${{ env.TAG }}
-          path: ./tmp
-
-      - name: Load docker images
-        uses: ./.github/actions/load-docker-images
-        with:
-          directory: ./tmp
-
-      - name: Install UV
-        run: ./test/scripts/gh-actions/setup-uv.sh
+          transport: ${{ needs.detect-changes.outputs.use_ghcr == 'true' && 'ghcr' || 'artifact' }}
+          images: 'kserve-controller kserve-localmodel-controller kserve-localmodelnode-agent agent router storage-initializer sklearnserver xgbserver predictiveserver custom-model-grpc custom-image-transformer-grpc image-transformer art-explainer'
 
       - name: Install KServe
         run: |
@@ -528,7 +419,37 @@ jobs:
         run: |
           ./test/scripts/gh-actions/run-e2e-tests.sh "transformer or mms or collocation" "6"
 
-      - name: Run E2E tests - explainer
+      - name: Check system status
+        if: always()
+        run: |
+          ./test/scripts/gh-actions/status-check.sh
+
+  test-explainer:
+    runs-on: ubuntu-latest
+    needs: [detect-changes, kserve-image-build, predictor-runtime-build, explainer-runtime-build]
+    strategy:
+      fail-fast: false
+      matrix:
+        install-method: ${{ fromJSON(needs.detect-changes.outputs.install_methods) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/e2e-test-setup
+
+      - name: Load test images
+        uses: ./.github/actions/load-test-images
+        with:
+          transport: ${{ needs.detect-changes.outputs.use_ghcr == 'true' && 'ghcr' || 'artifact' }}
+          images: 'kserve-controller kserve-localmodel-controller kserve-localmodelnode-agent agent router storage-initializer sklearnserver art-explainer'
+
+      - name: Install KServe
+        run: |
+          ${{ matrix.install-method == 'helm' && 'export INSTALL_METHOD="helm"' || '' }}
+          ${{ matrix.install-method == 'helm' && format('export SET_KSERVE_VERSION={0}', env.TAG) || '' }}
+          ./test/scripts/gh-actions/setup-kserve.sh
+          kubectl get pods -n kserve
+          kubectl describe pods -n kserve
+
+      - name: Run explainer E2E tests
         timeout-minutes: 30
         run: |
           ./test/scripts/gh-actions/run-e2e-tests.sh "explainer" "1"
@@ -547,75 +468,14 @@ jobs:
       matrix:
         install-method: ${{ fromJSON(needs.detect-changes.outputs.install_methods) }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/e2e-test-setup
 
-      - name: Merge target branch
-        if: github.event_name == 'pull_request'
-        run: |
-          git fetch --unshallow origin
-          git fetch origin ${{ github.event.pull_request.base.ref }}
-          git config user.email "ci@kserve.io"
-          git config user.name "CI Bot"
-          git merge --no-edit origin/${{ github.event.pull_request.base.ref }}
-
-      - name: Load KServe environment variables
-        run: ./kserve-images.sh --ci
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
+      - name: Load test images
+        uses: ./.github/actions/load-test-images
         with:
-          go-version-file: go.mod
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
-
-      - name: Free-up disk space
-        uses: ./.github/actions/free-up-disk-space
-
-      - name: Setup Minikube
-        uses: ./.github/actions/minikube-setup
-
-      - name: Download base images
-        uses: ./.github/actions/base-download
-
-      - name: KServe dependency setup
-        uses: ./.github/actions/kserve-dep-setup
-
-      - name: Download graph artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: ./tmp
-          pattern: ${{ env.GRAPH_ARTIFACT_PREFIX }}-*
-          merge-multiple: true
-
-      - name: Download sklearn server image
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ env.PREDICTOR_ARTIFACT_PREFIX }}-${{ env.SKLEARN_IMG }}-${{ env.TAG }}
-          path: ./tmp
-
-      - name: Download xgb server image
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ env.PREDICTOR_ARTIFACT_PREFIX }}-${{ env.XGB_IMG }}-${{ env.TAG }}
-          path: ./tmp
-
-      - name: Download predictiveserver image
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ env.PREDICTOR_ARTIFACT_PREFIX }}-${{ env.PREDICTIVE_IMG }}-${{ env.TAG }}
-          path: ./tmp
-
-      - name: Load docker images
-        uses: ./.github/actions/load-docker-images
-        with:
-          directory: ./tmp
-
-      - name: Install UV
-        run: ./test/scripts/gh-actions/setup-uv.sh
+          transport: ${{ needs.detect-changes.outputs.use_ghcr == 'true' && 'ghcr' || 'artifact' }}
+          images: 'kserve-controller kserve-localmodel-controller kserve-localmodelnode-agent agent router storage-initializer sklearnserver xgbserver predictiveserver success-200-isvc error-404-isvc'
 
       - name: Install KServe
         run: |
@@ -645,96 +505,20 @@ jobs:
       matrix:
         install-method: ${{ fromJSON(needs.detect-changes.outputs.install_methods) }}
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/e2e-test-setup
 
-      - name: Merge target branch
-        if: github.event_name == 'pull_request'
-        run: |
-          git fetch --unshallow origin
-          git fetch origin ${{ github.event.pull_request.base.ref }}
-          git config user.email "ci@kserve.io"
-          git config user.name "CI Bot"
-          git merge --no-edit origin/${{ github.event.pull_request.base.ref }}
-
-      - name: Load KServe environment variables
-        run: ./kserve-images.sh --ci
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
+      - name: Load test images
+        uses: ./.github/actions/load-test-images
         with:
-          go-version-file: go.mod
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
-
-      - name: Free-up disk space
-        uses: ./.github/actions/free-up-disk-space
-
-      - name: Setup Minikube
-        uses: ./.github/actions/minikube-setup
-
-      - name: Download base images
-        uses: ./.github/actions/base-download
-
-      - name: KServe dependency setup
-        uses: ./.github/actions/kserve-dep-setup
-
-      - name: Download sklearn server image
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ env.PREDICTOR_ARTIFACT_PREFIX }}-${{ env.SKLEARN_IMG }}-${{ env.TAG }}
-          path: ./tmp
-
-      - name: Download xgb server image
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ env.PREDICTOR_ARTIFACT_PREFIX }}-${{ env.XGB_IMG }}-${{ env.TAG }}
-          path: ./tmp
-
-      - name: Download lgb server image
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ env.PREDICTOR_ARTIFACT_PREFIX }}-${{ env.LGB_IMG }}-${{ env.TAG }}
-          path: ./tmp
-
-      - name: Download predictiveserver image
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ env.PREDICTOR_ARTIFACT_PREFIX }}-${{ env.PREDICTIVE_IMG }}-${{ env.TAG }}
-          path: ./tmp
-
-      - name: Download transformer image
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ env.TRANSFORMER_ARTIFACT_PREFIX }}-${{ env.IMAGE_TRANSFORMER_IMG }}-${{ env.TAG }}
-          path: ./tmp
-
-      - name: Download Art Explainer image
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ env.EXPLAINER_ARTIFACT_PREFIX }}-${{ env.ART_IMG }}-${{ env.TAG }}
-          path: ./tmp
-
-      - name: Load docker images
-        uses: ./.github/actions/load-docker-images
-        with:
-          directory: ./tmp
-
-      - name: Install UV
-        run: ./test/scripts/gh-actions/setup-uv.sh
+          transport: ${{ needs.detect-changes.outputs.use_ghcr == 'true' && 'ghcr' || 'artifact' }}
+          images: 'kserve-controller kserve-localmodel-controller kserve-localmodelnode-agent agent router storage-initializer sklearnserver xgbserver lgbserver predictiveserver image-transformer art-explainer'
 
       - name: Install KServe
         run: |
-          if [ "${{ matrix.install-method }}" == "helm" ]; then
-            export INSTALL_METHOD="helm"
-            export SET_KSERVE_VERSION=${{ env.TAG }}
-            export KSERVE_CUSTOM_ISVC_CONFIGS='kserve.controller.gateway.pathTemplate=/serving/{{ .Namespace }}/{{ .Name }}|kserve.controller.gateway.domain=mydomain.com'
-          else
-            export KSERVE_CUSTOM_ISVC_CONFIGS='ingress.pathTemplate=/serving/{{ .Namespace }}/{{ .Name }}|ingress.ingressDomain=mydomain.com'
-          fi
+          ${{ matrix.install-method == 'helm' && 'export INSTALL_METHOD="helm"' || '' }}
+          ${{ matrix.install-method == 'helm' && format('export SET_KSERVE_VERSION={0}', env.TAG) || '' }}
+          export KSERVE_CUSTOM_ISVC_CONFIGS='ingress.pathTemplate=/serving/{{ .Namespace }}/{{ .Name }}|ingress.ingressDomain=mydomain.com'
           export NETWORK_LAYER='istio-ingress'
           ./test/scripts/gh-actions/setup-kserve.sh
 
@@ -746,7 +530,39 @@ jobs:
         run: |
           ./test/scripts/gh-actions/run-e2e-tests.sh "path_based_routing" "6"
 
-      - name: Run E2E tests with path-based routing - Explainer
+      - name: Check system status
+        if: always()
+        run: |
+          ./test/scripts/gh-actions/status-check.sh
+
+  test-path-based-routing-explainer:
+    runs-on: ubuntu-latest
+    needs: [detect-changes, kserve-image-build, predictor-runtime-build, explainer-runtime-build]
+    strategy:
+      fail-fast: false
+      matrix:
+        install-method: ${{ fromJSON(needs.detect-changes.outputs.install_methods) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/e2e-test-setup
+
+      - name: Load test images
+        uses: ./.github/actions/load-test-images
+        with:
+          transport: ${{ needs.detect-changes.outputs.use_ghcr == 'true' && 'ghcr' || 'artifact' }}
+          images: 'kserve-controller kserve-localmodel-controller kserve-localmodelnode-agent agent router storage-initializer sklearnserver art-explainer'
+
+      - name: Install KServe
+        run: |
+          ${{ matrix.install-method == 'helm' && 'export INSTALL_METHOD="helm"' || '' }}
+          ${{ matrix.install-method == 'helm' && format('export SET_KSERVE_VERSION={0}', env.TAG) || '' }}
+          export KSERVE_CUSTOM_ISVC_CONFIGS='ingress.pathTemplate=/serving/{{ .Namespace }}/{{ .Name }}|ingress.ingressDomain=mydomain.com'
+          export NETWORK_LAYER='istio-ingress'
+          ./test/scripts/gh-actions/setup-kserve.sh
+          kubectl get pods -n kserve
+          kubectl describe pods -n kserve
+
+      - name: Run path-based routing explainer E2E tests
         timeout-minutes: 30
         run: |
           ./test/scripts/gh-actions/run-e2e-tests.sh "explainer" "1"
@@ -764,66 +580,14 @@ jobs:
       matrix:
         install-method: ${{ fromJSON(needs.detect-changes.outputs.install_methods) }}
     steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/e2e-test-setup
 
-      - name: Merge target branch
-        if: github.event_name == 'pull_request'
-        run: |
-          git fetch --unshallow origin
-          git fetch origin ${{ github.event.pull_request.base.ref }}
-          git config user.email "ci@kserve.io"
-          git config user.name "CI Bot"
-          git merge --no-edit origin/${{ github.event.pull_request.base.ref }}
-
-      - name: Load KServe environment variables
-        run: ./kserve-images.sh --ci
-
-      - name: Free-up disk space
-        uses: ./.github/actions/free-up-disk-space
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
+      - name: Load test images
+        uses: ./.github/actions/load-test-images
         with:
-          go-version-file: go.mod
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
-
-      - name: Setup Minikube
-        uses: ./.github/actions/minikube-setup
-
-      - name: KServe dependency setup
-        uses: ./.github/actions/kserve-dep-setup
-
-      - name: Download base images
-        uses: ./.github/actions/base-download
-
-      - name: Build queue proxy extension image
-        run: |
-          ./test/scripts/gh-actions/build-qpext-image.sh
-          docker image ls
-
-      - name: Download sklearn server image
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ env.PREDICTOR_ARTIFACT_PREFIX }}-${{ env.SKLEARN_IMG }}-${{ env.TAG }}
-          path: ./tmp
-
-      - name: Download predictiveserver image
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ env.PREDICTOR_ARTIFACT_PREFIX }}-${{ env.PREDICTIVE_IMG }}-${{ env.TAG }}
-          path: ./tmp
-
-      - name: Load docker images
-        uses: ./.github/actions/load-docker-images
-        with:
-          directory: ./tmp
-
-      - name: Install UV
-        run: ./test/scripts/gh-actions/setup-uv.sh
+          transport: ${{ needs.detect-changes.outputs.use_ghcr == 'true' && 'ghcr' || 'artifact' }}
+          images: 'kserve-controller kserve-localmodel-controller kserve-localmodelnode-agent agent router storage-initializer qpext sklearnserver predictiveserver'
 
       - name: Install KServe
         run: |
@@ -851,47 +615,16 @@ jobs:
 
   test-with-helm:
     runs-on: ubuntu-latest
-    needs: [kserve-image-build]
+    needs: [detect-changes, kserve-image-build]
     steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/e2e-test-setup
 
-      - name: Merge target branch
-        if: github.event_name == 'pull_request'
-        run: |
-          git fetch --unshallow origin
-          git fetch origin ${{ github.event.pull_request.base.ref }}
-          git config user.email "ci@kserve.io"
-          git config user.name "CI Bot"
-          git merge --no-edit origin/${{ github.event.pull_request.base.ref }}
-
-      - name: Load KServe environment variables
-        run: ./kserve-images.sh --ci
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
+      - name: Load test images
+        uses: ./.github/actions/load-test-images
         with:
-          go-version-file: go.mod
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
-
-      - name: Free-up disk space
-        uses: ./.github/actions/free-up-disk-space
-
-      - name: Setup Minikube
-        uses: ./.github/actions/minikube-setup
-
-      - name: KServe dependency setup
-        uses: ./.github/actions/kserve-dep-setup
-
-      - name: Download base images
-        uses: ./.github/actions/base-download
-
-      - name: Install UV
-        run: ./test/scripts/gh-actions/setup-uv.sh
+          transport: ${{ needs.detect-changes.outputs.use_ghcr == 'true' && 'ghcr' || 'artifact' }}
+          images: 'kserve-controller kserve-localmodel-controller kserve-localmodelnode-agent agent router storage-initializer'
 
       - name: Install Kserve from helm
         run: |
@@ -923,95 +656,19 @@ jobs:
     needs:
       [detect-changes, kserve-image-build, predictor-runtime-build, explainer-runtime-build]
     steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-
-      - name: Merge target branch
-        if: github.event_name == 'pull_request'
-        run: |
-          git fetch --unshallow origin
-          git fetch origin ${{ github.event.pull_request.base.ref }}
-          git config user.email "ci@kserve.io"
-          git config user.name "CI Bot"
-          git merge --no-edit origin/${{ github.event.pull_request.base.ref }}
-
-      - name: Load KServe environment variables
-        run: ./kserve-images.sh --ci
-
-      - name: Free-up disk space
-        uses: ./.github/actions/free-up-disk-space
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
-
-      - name: Setup Minikube
-        uses: ./.github/actions/minikube-setup
-
-      - name: Enable metrics server
-        run: |
-          minikube addons enable metrics-server
-          kubectl rollout status deployment/metrics-server -n kube-system --timeout=180s
-          kubectl get pods -n kube-system | grep metrics-server
-
-      - name: Check Metrics Server Logs
-        run: |
-          kubectl logs -n kube-system deploy/metrics-server
-
-      - name: KServe dependency setup
-        uses: ./.github/actions/kserve-dep-setup
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/e2e-test-setup
         with:
           deployment-mode: "raw"
           enable-keda: "true"
           network-layer: ${{ matrix.network-layer }}
+          minikube-addons: metrics-server
 
-      - name: Download base images
-        uses: ./.github/actions/base-download
-
-      - name: Download sklearn server image
-        uses: actions/download-artifact@v4
+      - name: Load test images
+        uses: ./.github/actions/load-test-images
         with:
-          name: ${{ env.PREDICTOR_ARTIFACT_PREFIX }}-${{ env.SKLEARN_IMG }}-${{ env.TAG }}
-          path: ./tmp
-
-      - name: Download xgb server image
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ env.PREDICTOR_ARTIFACT_PREFIX }}-${{ env.XGB_IMG }}-${{ env.TAG }}
-          path: ./tmp
-
-      - name: Download predictiveserver image
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ env.PREDICTOR_ARTIFACT_PREFIX }}-${{ env.PREDICTIVE_IMG }}-${{ env.TAG }}
-          path: ./tmp
-
-      - name: Download custom model grpc image
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ env.PREDICTOR_ARTIFACT_PREFIX }}-${{ env.CUSTOM_MODEL_GRPC_IMG }}-${{ env.TAG }}
-          path: ./tmp
-
-      - name: Download transformer and explainer artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: ./tmp
-          pattern: +(${{ env.TRANSFORMER_ARTIFACT_PREFIX }}|${{ env.EXPLAINER_ARTIFACT_PREFIX }})-*
-          merge-multiple: true
-
-      - name: Load docker images
-        uses: ./.github/actions/load-docker-images
-        with:
-          directory: ./tmp
-
-      - name: Install UV
-        run: ./test/scripts/gh-actions/setup-uv.sh
+          transport: ${{ needs.detect-changes.outputs.use_ghcr == 'true' && 'ghcr' || 'artifact' }}
+          images: 'kserve-controller kserve-localmodel-controller kserve-localmodelnode-agent agent router storage-initializer sklearnserver xgbserver predictiveserver custom-model-grpc custom-image-transformer-grpc image-transformer art-explainer'
 
       - name: Install KServe
         run: |
@@ -1067,76 +724,19 @@ jobs:
       matrix:
         install-method: ${{ fromJSON(needs.detect-changes.outputs.install_methods) }}
     steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-
-      - name: Merge target branch
-        if: github.event_name == 'pull_request'
-        run: |
-          git fetch --unshallow origin
-          git fetch origin ${{ github.event.pull_request.base.ref }}
-          git config user.email "ci@kserve.io"
-          git config user.name "CI Bot"
-          git merge --no-edit origin/${{ github.event.pull_request.base.ref }}
-
-      - name: Load KServe environment variables
-        run: ./kserve-images.sh --ci
-
-      - name: Free-up disk space
-        uses: ./.github/actions/free-up-disk-space
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
-
-      - name: Setup Minikube
-        uses: ./.github/actions/minikube-setup
-
-      - name: Enable metrics server
-        run: |
-          minikube addons enable metrics-server
-          kubectl rollout status deployment/metrics-server -n kube-system --timeout=180s
-          kubectl get pods -n kube-system | grep metrics-server
-
-      - name: Check Metrics Server Logs
-        run: |
-          kubectl logs -n kube-system deploy/metrics-server
-
-      - name: KServe dependency setup
-        uses: ./.github/actions/kserve-dep-setup
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/e2e-test-setup
         with:
           deployment-mode: "raw"
           enable-keda: "true"
           network-layer: "istio-ingress"
+          minikube-addons: metrics-server
 
-      - name: Download base images
-        uses: ./.github/actions/base-download
-
-      - name: Download sklearn server image
-        uses: actions/download-artifact@v4
+      - name: Load test images
+        uses: ./.github/actions/load-test-images
         with:
-          name: ${{ env.PREDICTOR_ARTIFACT_PREFIX }}-${{ env.SKLEARN_IMG }}-${{ env.TAG }}
-          path: ./tmp
-
-      - name: Download predictiveserver image
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ env.PREDICTOR_ARTIFACT_PREFIX }}-${{ env.PREDICTIVE_IMG }}-${{ env.TAG }}
-          path: ./tmp
-
-      - name: Load docker images
-        uses: ./.github/actions/load-docker-images
-        with:
-          directory: ./tmp
-
-      - name: Install UV
-        run: ./test/scripts/gh-actions/setup-uv.sh
+          transport: ${{ needs.detect-changes.outputs.use_ghcr == 'true' && 'ghcr' || 'artifact' }}
+          images: 'kserve-controller kserve-localmodel-controller kserve-localmodelnode-agent agent router storage-initializer sklearnserver predictiveserver'
 
       - name: Install KServe
         run: |
@@ -1170,87 +770,22 @@ jobs:
       matrix:
         install-method: ${{ fromJSON(needs.detect-changes.outputs.install_methods) }}
     steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
-
-      - name: Merge target branch
-        if: github.event_name == 'pull_request'
-        run: |
-          git fetch --unshallow origin
-          git fetch origin ${{ github.event.pull_request.base.ref }}
-          git config user.email "ci@kserve.io"
-          git config user.name "CI Bot"
-          git merge --no-edit origin/${{ github.event.pull_request.base.ref }}
-
-      - name: Load KServe environment variables
-        run: ./kserve-images.sh --ci
-
-      - name: Free-up disk space
-        uses: ./.github/actions/free-up-disk-space
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/e2e-test-setup
         with:
-          go-version-file: go.mod
+          network-layer: kourier
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - name: Load test images
+        uses: ./.github/actions/load-test-images
         with:
-          python-version: "3.10"
-
-      - name: Setup Minikube
-        uses: ./.github/actions/minikube-setup
-
-      - name: KServe dependency setup
-        uses: ./.github/actions/kserve-dep-setup
-        with:
-          network-layer: "kourier"
-
-      - name: Download base images
-        uses: ./.github/actions/base-download
-
-      - name: Download graph artifacts
-        uses: actions/download-artifact@v4
-        with:
-          path: ./tmp
-          pattern: ${{ env.GRAPH_ARTIFACT_PREFIX }}-*
-          merge-multiple: true
-
-      - name: Download sklearn server image
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ env.PREDICTOR_ARTIFACT_PREFIX }}-${{ env.SKLEARN_IMG }}-${{ env.TAG }}
-          path: ./tmp
-
-      - name: Download xgb server image
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ env.PREDICTOR_ARTIFACT_PREFIX }}-${{ env.XGB_IMG }}-${{ env.TAG }}
-          path: ./tmp
-
-      - name: Download predictiveserver image
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ env.PREDICTOR_ARTIFACT_PREFIX }}-${{ env.PREDICTIVE_IMG }}-${{ env.TAG }}
-          path: ./tmp
-
-      - name: Load docker images
-        uses: ./.github/actions/load-docker-images
-        with:
-          directory: ./tmp
-
-      - name: Install UV
-        run: ./test/scripts/gh-actions/setup-uv.sh
+          transport: ${{ needs.detect-changes.outputs.use_ghcr == 'true' && 'ghcr' || 'artifact' }}
+          images: 'kserve-controller kserve-localmodel-controller kserve-localmodelnode-agent agent router storage-initializer sklearnserver xgbserver predictiveserver success-200-isvc error-404-isvc'
 
       - name: Install KServe
         run: |
-          if [ "${{ matrix.install-method }}" == "helm" ]; then
-            export INSTALL_METHOD="helm"
-            export SET_KSERVE_VERSION=${{ env.TAG }}
-            export KSERVE_CUSTOM_ISVC_CONFIGS='kserve.controller.gateway.disableIstioVirtualHost=true'
-          else
-            export KSERVE_CUSTOM_ISVC_CONFIGS='ingress.disableIstioVirtualHost=true'
-          fi
+          ${{ matrix.install-method == 'helm' && 'export INSTALL_METHOD="helm"' || '' }}
+          ${{ matrix.install-method == 'helm' && format('export SET_KSERVE_VERSION={0}', env.TAG) || '' }}
+          export KSERVE_CUSTOM_ISVC_CONFIGS='ingress.disableIstioVirtualHost=true'
           ./test/scripts/gh-actions/setup-kserve.sh
 
           kubectl get pods -n kserve
@@ -1272,61 +807,20 @@ jobs:
 
   test-llm:
     runs-on: ubuntu-latest
-    needs: [detect-changes, kserve-image-build, predictor-runtime-build]
+    needs: [detect-changes, kserve-image-build, huggingfaceserver-build]
     strategy:
       fail-fast: false
       matrix:
         install-method: ${{ fromJSON(needs.detect-changes.outputs.install_methods) }}
     steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/e2e-test-setup
 
-      - name: Merge target branch
-        if: github.event_name == 'pull_request'
-        run: |
-          git fetch --unshallow origin
-          git fetch origin ${{ github.event.pull_request.base.ref }}
-          git config user.email "ci@kserve.io"
-          git config user.name "CI Bot"
-          git merge --no-edit origin/${{ github.event.pull_request.base.ref }}
-
-      - name: Load KServe environment variables
-        run: ./kserve-images.sh --ci
-
-      - name: Free-up disk space
-        uses: ./.github/actions/free-up-disk-space
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
+      - name: Load test images
+        uses: ./.github/actions/load-test-images
         with:
-          go-version-file: go.mod
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
-
-      - name: Setup Minikube
-        uses: ./.github/actions/minikube-setup
-
-      - name: KServe dependency setup
-        uses: ./.github/actions/kserve-dep-setup
-
-      - name: Download base images
-        uses: ./.github/actions/base-download
-
-      - name: Download huggingface server image
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ env.HUGGINGFACE_IMG }}-${{ env.TAG }}
-          path: ./tmp
-
-      - name: Load docker images
-        uses: ./.github/actions/load-docker-images
-        with:
-          directory: ./tmp
-
-      - name: Install UV
-        run: ./test/scripts/gh-actions/setup-uv.sh
+          transport: ${{ needs.detect-changes.outputs.use_ghcr == 'true' && 'ghcr' || 'artifact' }}
+          images: 'kserve-controller kserve-localmodel-controller kserve-localmodelnode-agent agent router storage-initializer huggingfaceserver predictiveserver'
 
       - name: Install KServe
         run: |
@@ -1349,61 +843,20 @@ jobs:
 
   test-huggingface-server-vllm:
     runs-on: ubuntu-latest
-    needs: [detect-changes, kserve-image-build, predictor-runtime-build]
+    needs: [detect-changes, kserve-image-build, huggingfaceserver-build]
     strategy:
       fail-fast: false
       matrix:
         install-method: ${{ fromJSON(needs.detect-changes.outputs.install_methods) }}
     steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/e2e-test-setup
 
-      - name: Merge target branch
-        if: github.event_name == 'pull_request'
-        run: |
-          git fetch --unshallow origin
-          git fetch origin ${{ github.event.pull_request.base.ref }}
-          git config user.email "ci@kserve.io"
-          git config user.name "CI Bot"
-          git merge --no-edit origin/${{ github.event.pull_request.base.ref }}
-
-      - name: Load KServe environment variables
-        run: ./kserve-images.sh --ci
-
-      - name: Free-up disk space
-        uses: ./.github/actions/free-up-disk-space
-
-      - name: Setup Go
-        uses: actions/setup-go@v5
+      - name: Load test images
+        uses: ./.github/actions/load-test-images
         with:
-          go-version-file: go.mod
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
-
-      - name: Setup Minikube
-        uses: ./.github/actions/minikube-setup
-
-      - name: KServe dependency setup
-        uses: ./.github/actions/kserve-dep-setup
-
-      - name: Download base images
-        uses: ./.github/actions/base-download
-
-      - name: Download huggingface server image
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ env.HUGGINGFACE_IMG }}-${{ env.TAG }}
-          path: ./tmp
-
-      - name: Load docker images
-        uses: ./.github/actions/load-docker-images
-        with:
-          directory: ./tmp
-
-      - name: Install UV
-        run: ./test/scripts/gh-actions/setup-uv.sh
+          transport: ${{ needs.detect-changes.outputs.use_ghcr == 'true' && 'ghcr' || 'artifact' }}
+          images: 'kserve-controller kserve-localmodel-controller kserve-localmodelnode-agent agent router storage-initializer huggingfaceserver predictiveserver'
 
       - name: Install KServe
         run: |
@@ -1426,14 +879,13 @@ jobs:
 
   test-modelcache:
     runs-on: ubuntu-latest
-    needs: [detect-changes, kserve-image-build, predictor-runtime-build]
+    needs: [detect-changes, kserve-image-build, huggingfaceserver-build]
     strategy:
       fail-fast: false
       matrix:
         install-method: ${{ fromJSON(needs.detect-changes.outputs.install_methods) }}
     steps:
-      - name: Checkout source
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
       - name: Merge target branch
         if: github.event_name == 'pull_request'
@@ -1479,49 +931,54 @@ jobs:
       - name: KServe dependency setup
         uses: ./.github/actions/kserve-dep-setup
 
-      - name: Download base images
+      - name: Download base image artifacts
+        if: needs.detect-changes.outputs.use_ghcr != 'true'
         uses: actions/download-artifact@v4
         with:
-          path: /tmp-images
-          pattern: ${{ env.BASE_ARTIFACT_PREFIX }}-*
+          pattern: base-*
+          path: /tmp/images
           merge-multiple: true
 
-      - name: Load base docker images
+      - name: Download runtime image artifacts
+        if: needs.detect-changes.outputs.use_ghcr != 'true'
+        uses: actions/download-artifact@v4
+        with:
+          pattern: runtime-huggingfaceserver
+          path: /tmp/images
+          merge-multiple: true
+
+      - name: Load base images into minikube nodes
         run: |
-          ls -l /tmp-images
-          minikube ssh -n minikube -- ls -l /tmp-images
-          files=$(find /tmp-images -maxdepth 1 -type f)
-          for file in ${files[@]};do
-            echo "Loading image $(basename ${file})"
-            minikube ssh -n minikube -- docker image load -i ${file}
-            minikube ssh -n minikube-m02 -- docker image load -i ${file}
-            minikube ssh -n minikube-m03 -- docker image load -i ${file}
+          USE_GHCR="${{ needs.detect-changes.outputs.use_ghcr }}"
+          for img in kserve-controller kserve-localmodel-controller kserve-localmodelnode-agent agent router storage-initializer; do
+            if [[ "$USE_GHCR" == "true" ]]; then
+              docker pull "${GHCR_REPO}/${img}:${TAG}"
+              docker tag "${GHCR_REPO}/${img}:${TAG}" "kserve/${img}:${TAG}"
+            else
+              docker load -i "/tmp/images/${img}.tar"
+            fi
+            docker save "kserve/${img}:${TAG}" > "/tmp-images/${img}-${TAG}"
+            minikube ssh -n minikube -- docker image load -i "/tmp-images/${img}-${TAG}"
+            minikube ssh -n minikube-m02 -- docker image load -i "/tmp-images/${img}-${TAG}"
+            minikube ssh -n minikube-m03 -- docker image load -i "/tmp-images/${img}-${TAG}"
           done
           sudo rm -rf /tmp-images/*
           minikube ssh -n minikube -- docker image ls
           minikube ssh -n minikube-m02 -- docker image ls
           minikube ssh -n minikube-m03 -- docker image ls
 
-      - name: Download huggingface server image
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ env.HUGGINGFACE_IMG }}-${{ env.TAG }}
-          path: /tmp-images
-
-      - name: Download sklearn server image
-        uses: actions/download-artifact@v4
-        with:
-          name: ${{ env.PREDICTOR_ARTIFACT_PREFIX }}-${{ env.SKLEARN_IMG }}-${{ env.TAG }}
-          path: /tmp-images
-
-      - name: Load runtime docker images
+      - name: Load huggingface server image into minikube
         run: |
-          files=$(find /tmp-images -maxdepth 1 -type f)
-          for file in ${files[@]};do
-            echo "Loading image $(basename ${file})"
-            minikube ssh -n minikube-m02 -- docker image load -i ${file}
-          done
-          sudo rm -rf tmp-images/*
+          USE_GHCR="${{ needs.detect-changes.outputs.use_ghcr }}"
+          if [[ "$USE_GHCR" == "true" ]]; then
+            docker pull "${GHCR_REPO}/huggingfaceserver:${TAG}"
+            docker tag "${GHCR_REPO}/huggingfaceserver:${TAG}" "kserve/huggingfaceserver:${TAG}"
+          else
+            docker load -i "/tmp/images/huggingfaceserver.tar"
+          fi
+          docker save "kserve/huggingfaceserver:${TAG}" > "/tmp-images/huggingfaceserver-${TAG}"
+          minikube ssh -n minikube-m02 -- docker image load -i "/tmp-images/huggingfaceserver-${TAG}"
+          sudo rm -rf /tmp-images/*
           minikube ssh -n minikube-m02 -- docker image ls
 
       - name: Create model root directory
@@ -1536,6 +993,7 @@ jobs:
         run: |
           ${{ matrix.install-method == 'helm' && 'export INSTALL_METHOD="helm"' || '' }}
           export SET_KSERVE_VERSION=${{ env.TAG }}
+          export KSERVE_CUSTOM_ISVC_CONFIGS="localModel.enabled=true|localModel.defaultJobImage=kserve/storage-initializer:${TAG}"
           ./test/scripts/gh-actions/setup-kserve.sh
 
           kubectl get pods -n kserve

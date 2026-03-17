@@ -1,0 +1,93 @@
+name: 'E2E Test Setup'
+description: 'Common setup preamble for E2E test jobs: env vars, disk space, Go, Python, Minikube, KServe deps, UV'
+
+inputs:
+  network-layer:
+    description: 'Network layer to install (istio, kourier, etc.)'
+    required: false
+    default: 'istio'
+  deployment-mode:
+    description: 'Kserve deployment mode (serverless or raw)'
+    required: false
+    default: 'serverless'
+  enable-keda:
+    description: 'Enable KEDA for autoscaling'
+    required: false
+    default: 'false'
+  minikube-addons:
+    description: 'Comma-separated minikube addons to enable (e.g. metrics-server,metallb)'
+    required: false
+    default: ''
+  kserve-custom-configs:
+    description: 'Custom KServe InferenceService config overrides'
+    required: false
+    default: ''
+  minikube-nodes:
+    description: 'Number of minikube nodes'
+    required: false
+    default: '1'
+  minikube-driver:
+    description: 'Minikube driver'
+    required: false
+    default: 'none'
+  minikube-start-args:
+    description: 'Additional minikube start args'
+    required: false
+    default: ''
+
+runs:
+  using: "composite"
+  steps:
+    - name: Merge target branch
+      if: github.event_name == 'pull_request'
+      shell: bash
+      run: |
+        git fetch --unshallow origin
+        git fetch origin ${{ github.event.pull_request.base.ref }}
+        git config user.email "ci@kserve.io"
+        git config user.name "CI Bot"
+        git merge --no-edit origin/${{ github.event.pull_request.base.ref }}
+
+    - name: Load KServe environment variables
+      shell: bash
+      run: ./kserve-images.sh --ci
+
+    - name: Free-up disk space
+      uses: ./.github/actions/free-up-disk-space
+
+    - name: Setup Go
+      uses: actions/setup-go@v5
+      with:
+        go-version-file: go.mod
+
+    - name: Setup Python
+      id: setup-python
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.10"
+
+    - name: Cache Python test venv
+      uses: actions/cache@v4
+      id: python-test-cache
+      with:
+        path: python/kserve/.venv
+        key: python-test-venv-${{ runner.os }}-py${{ steps.setup-python.outputs.python-version }}-${{ hashFiles('python/kserve/uv.lock') }}
+
+    - name: Setup Minikube
+      uses: ./.github/actions/minikube-setup
+      with:
+        nodes: ${{ inputs.minikube-nodes }}
+        driver: ${{ inputs.minikube-driver }}
+        start-args: ${{ inputs.minikube-start-args }}
+        addons: ${{ inputs.minikube-addons }}
+
+    - name: KServe dependency setup
+      uses: ./.github/actions/kserve-dep-setup
+      with:
+        network-layer: ${{ inputs.network-layer }}
+        deployment-mode: ${{ inputs.deployment-mode }}
+        enable-keda: ${{ inputs.enable-keda }}
+
+    - name: Install UV
+      shell: bash
+      run: ./test/scripts/gh-actions/setup-uv.sh

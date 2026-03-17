@@ -1,0 +1,46 @@
+name: 'Load Test Images'
+description: 'Loads container images for E2E tests from GHCR (fast) or GHA artifacts (fork-compatible)'
+
+inputs:
+  transport:
+    description: 'Image transport: ghcr or artifact'
+    required: true
+  images:
+    description: 'Space-separated list of all image names to load'
+    required: true
+
+runs:
+  using: "composite"
+  steps:
+    # GHCR mode: parallel pull and retag
+    - name: Pull images from GHCR
+      if: inputs.transport == 'ghcr'
+      shell: bash
+      run: |
+        for img in ${{ inputs.images }}; do
+          docker pull "${GHCR_REPO}/${img}:${TAG}" &
+        done
+        wait
+        for img in ${{ inputs.images }}; do
+          docker tag "${GHCR_REPO}/${img}:${TAG}" "kserve/${img}:${TAG}"
+        done
+        docker image ls
+
+    # Artifact mode: download tars and parallel load
+    - name: Download image artifacts
+      if: inputs.transport == 'artifact'
+      uses: actions/download-artifact@v4
+      with:
+        pattern: '{base-*,runtime-*,graph-*}'
+        path: /tmp/images
+        merge-multiple: true
+
+    - name: Load images from artifacts
+      if: inputs.transport == 'artifact'
+      shell: bash
+      run: |
+        for img in ${{ inputs.images }}; do
+          docker load -i "/tmp/images/${img}.tar" &
+        done
+        wait
+        docker image ls

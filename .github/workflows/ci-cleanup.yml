@@ -1,0 +1,22 @@
+name: CI Cleanup
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  actions: write
+
+jobs:
+  cleanup-gha-cache:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Delete GHA build caches for PR branch
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          BRANCH: refs/pull/${{ github.event.pull_request.number }}/merge
+        run: |
+          echo "Deleting GHA caches for: ${BRANCH}"
+          gh cache list --ref "${BRANCH}" --json id --jq '.[].id' |
+            xargs -r -I {} gh cache delete {} || true
