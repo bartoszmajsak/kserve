@@ -44,7 +44,11 @@ kubectl get namespace kserve-ci-e2e-test || kubectl create namespace kserve-ci-e
 
 echo "Installing KServe Python SDK ..."
 pushd python/kserve >/dev/null
-    uv sync --active --group test
+    if [ ! -d ".venv/lib" ]; then
+        uv sync --active --group test
+    else
+        echo "Using cached Python test venv"
+    fi
 popd
 
 
