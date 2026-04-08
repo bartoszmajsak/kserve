@@ -195,11 +195,11 @@ func main() {
 		},
 	}
 
-	if err := customizeManagerOptions(&mgrOpts); err != nil {
+	if err := customizeManagerOptions(cfg, &mgrOpts); err != nil {
 		setupLog.Error(err, "failed to apply distribution-specific manager options")
 		os.Exit(1)
 	}
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), mgrOpts)
+	mgr, err := ctrl.NewManager(cfg, mgrOpts)
 	if err != nil {
 		setupLog.Error(err, "unable to start manager")
 		os.Exit(1)
