@@ -19,6 +19,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -76,24 +77,28 @@ func init() {
 }
 
 type Options struct {
-	metricsAddr          string
-	webhookPort          int
-	enableLeaderElection bool
-	probeAddr            string
-	metricsSecure        bool
-	enableHTTP2          bool
-	zapOpts              zap.Options
+	metricsAddr            string
+	webhookPort            int
+	enableLeaderElection   bool
+	probeAddr              string
+	metricsSecure          bool
+	enableHTTP2            bool
+	migrationTimeout       time.Duration
+	migrationPollInterval  time.Duration
+	zapOpts                zap.Options
 }
 
 func DefaultOptions() Options {
 	return Options{
-		metricsAddr:          ":8443",
-		webhookPort:          9443,
-		enableLeaderElection: false,
-		probeAddr:            ":8081",
-		metricsSecure:        true,
-		enableHTTP2:          false,
-		zapOpts:              zap.Options{},
+		metricsAddr:           ":8443",
+		webhookPort:           9443,
+		enableLeaderElection:  false,
+		probeAddr:             ":8081",
+		metricsSecure:         true,
+		enableHTTP2:           false,
+		migrationTimeout:      1 * time.Hour,
+		migrationPollInterval: 30 * time.Second,
+		zapOpts:               zap.Options{},
 	}
 }
 
@@ -108,6 +113,8 @@ func GetOptions() Options {
 	flag.StringVar(&opts.probeAddr, "health-probe-addr", opts.probeAddr, "The address the probe endpoint binds to.")
 	flag.BoolVar(&opts.metricsSecure, "metrics-secure", opts.metricsSecure, "Whether to serve metric via HTTPS.")
 	flag.BoolVar(&opts.enableHTTP2, "enable-http2", false, "If set, HTTP/2 will be enabled for the metrics and webhook servers")
+	flag.DurationVar(&opts.migrationTimeout, "storage-migration-timeout", opts.migrationTimeout, "Total retry budget for storage version migration.")
+	flag.DurationVar(&opts.migrationPollInterval, "storage-migration-poll-interval", opts.migrationPollInterval, "Polling interval for storage version migration retries after initial backoff.")
 	opts.zapOpts.BindFlags(flag.CommandLine)
 	flag.Parse()
 	return opts
@@ -275,23 +282,20 @@ func main() {
 	// after the webhook server and cache sync are ready. This avoids the
 	// chicken-and-egg problem where migration patches trigger validating webhooks
 	// that aren't serving yet.
-	// migrationBackoff allows enough time for Service endpoints to propagate
-	// after the webhook server starts.
-	migrationBackoff := wait.Backoff{
-		Duration: 2 * time.Second,
-		Factor:   1.5,
-		Jitter:   0.1,
-		Steps:    10,
-	}
+	migrationTimeout := options.migrationTimeout
+	migrationPollInterval := options.migrationPollInterval
 	if err := mgr.Add(leaderRunnable(func(ctx context.Context) error {
-		setupLog.Info("running storage version migration")
+		migrationCtx, cancel := context.WithTimeout(ctx, migrationTimeout)
+		defer cancel()
+		setupLog.Info("running storage version migration",
+			"timeout", migrationTimeout, "pollInterval", migrationPollInterval)
 		migrator := storageversion.NewMigrator(dynamic.NewForConfigOrDie(cfg), apixclient.NewForConfigOrDie(cfg))
 		for _, gr := range []schema.GroupResource{
 			{Group: v1alpha2.SchemeGroupVersion.Group, Resource: "llminferenceservices"},
 			{Group: v1alpha2.SchemeGroupVersion.Group, Resource: "llminferenceserviceconfigs"},
 		} {
 			var lastErr error
-			if err := wait.ExponentialBackoffWithContext(ctx, migrationBackoff, func(ctx context.Context) (bool, error) {
+			condition := func(ctx context.Context) (bool, error) {
 				if err := migrator.Migrate(ctx, gr); err != nil {
 					lastErr = err
 					if apierrors.IsForbidden(err) || apierrors.IsUnauthorized(err) || apierrors.IsNotFound(err) {
@@ -301,11 +305,32 @@ func main() {
 					return false, nil
 				}
 				return true, nil
-			}); err != nil {
-				if lastErr != nil && wait.Interrupted(err) {
-					return fmt.Errorf("storage version migration for %s timed out: %w", gr, lastErr)
+			}
+			reportErr := func(err error) error {
+				if lastErr != nil && migrationCtx.Err() != nil {
+					if errors.Is(migrationCtx.Err(), context.DeadlineExceeded) {
+						return fmt.Errorf("storage version migration for %s timed out after %s: %w", gr, migrationTimeout, lastErr)
+					}
+					return fmt.Errorf("storage version migration for %s cancelled: %w", gr, lastErr)
 				}
 				return fmt.Errorf("storage version migration for %s failed: %w", gr, err)
+			}
+			// Phase 1: exponential backoff for quick initial detection.
+			// Cap must not be set - it zeroes Steps on first hit, causing early exit.
+			fastBackoff := wait.Backoff{Duration: 2 * time.Second, Factor: 1.5, Jitter: 0.1, Steps: 10}
+			if err := wait.ExponentialBackoffWithContext(migrationCtx, fastBackoff, condition); err == nil {
+				continue
+			} else if !wait.Interrupted(err) {
+				return reportErr(err)
+			}
+			// Phase 2: fixed-interval polling for the remaining timeout budget.
+			// immediate=false: phase 1 already attempted on its last step.
+			// wait.Interrupted also matches context errors, so an expired migrationCtx
+			// reaches here too - PollUntilContextCancel returns immediately in that case.
+			setupLog.Info("fast migration retries exhausted, switching to steady-state polling",
+				"resource", gr, "pollInterval", migrationPollInterval)
+			if err := wait.PollUntilContextCancel(migrationCtx, migrationPollInterval, false, condition); err != nil {
+				return reportErr(err)
 			}
 		}
 		setupLog.Info("storage version migration completed")
