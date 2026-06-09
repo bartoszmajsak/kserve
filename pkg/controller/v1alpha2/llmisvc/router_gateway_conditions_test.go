@@ -482,7 +482,7 @@ func TestHTTPRouteConditionsEvaluation(t *testing.T) {
 				Client: fakeClient,
 			}
 
-			err = reconciler.EvaluateHTTPRouteConditions(ctx, tt.llmSvc, &llmisvc.Config{})
+			err = reconciler.EvaluateHTTPRouteConditions(ctx, tt.llmSvc)
 
 			if tt.expectedErrorMsg != "" {
 				g.Expect(err).To(HaveOccurred())
