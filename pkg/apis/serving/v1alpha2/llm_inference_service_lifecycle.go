@@ -110,6 +110,8 @@ const (
 	// group members serve different model names, ModelNameAmbiguous when no
 	// strict majority exists, or BackendResolutionFailed when no members
 	// could be resolved.
+	// Independent of the Ready rollup - a broken group does not block the
+	// resource from being Ready, since individual routing still works.
 	// Only present when traffic splitting is configured (group + weight set).
 	TrafficGroupReady apis.ConditionType = "TrafficGroupReady"
 
@@ -319,7 +321,6 @@ func (in *LLMInferenceService) DetermineRouterReadiness() {
 		in.GetStatus().GetCondition(HTTPRoutesReady),
 		in.GetStatus().GetCondition(InferencePoolReady),
 		in.GetStatus().GetCondition(SchedulerWorkloadReady),
-		in.GetStatus().GetCondition(TrafficGroupReady),
 	}
 
 	for _, cond := range subConditions {
@@ -331,5 +332,6 @@ func (in *LLMInferenceService) DetermineRouterReadiness() {
 			return
 		}
 	}
+
 	in.GetConditionSet().Manage(in.GetStatus()).MarkTrue(RouterReady)
 }

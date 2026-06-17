@@ -136,12 +136,40 @@ func (r *LLMISVCReconciler) reconcileHTTPRoutes(ctx context.Context, llmSvc *v1a
 
 	expectedHTTPRoute := r.expectedHTTPRoute(ctx, llmSvc, cfg)
 
+	// Force-stop: grouped members preserve their route (weight set to 0),
+	// non-grouped members delete the route (existing behavior).
+	if utils.GetForceStopRuntime(llmSvc) {
+		if !llmSvc.Spec.Router.HasGroup() {
+			llmSvc.MarkTrafficGroupReadyUnset()
+			if _, err := r.updateRoutingStatus(ctx, llmSvc); err != nil {
+				return nil, err
+			}
+			return nil, Delete(ctx, r, llmSvc, expectedHTTPRoute)
+		}
+		// Grouped: fall through. Route preserved, weight overridden to 0
+		// in resolveGroupMembers.
+	}
+
 	// Clean up if router or routes are not configured
-	if utils.GetForceStopRuntime(llmSvc) || llmSvc.Spec.Router == nil || llmSvc.Spec.Router.Route == nil {
+	if llmSvc.Spec.Router == nil || llmSvc.Spec.Router.Route == nil {
+		llmSvc.MarkTrafficGroupReadyUnset()
 		if _, err := r.updateRoutingStatus(ctx, llmSvc); err != nil {
 			return nil, err
 		}
 		return nil, Delete(ctx, r, llmSvc, expectedHTTPRoute)
+	}
+
+	// Inject group members' backendRefs for traffic splitting.
+	// Non-grouped members clear any stale TrafficGroupReady condition.
+	if llmSvc.Spec.Router.HasGroup() {
+		if err := r.injectGroupBackendRefs(ctx, llmSvc, expectedHTTPRoute, cfg); err != nil {
+			return nil, err
+		}
+	} else {
+		llmSvc.MarkTrafficGroupReadyUnset()
+		if llmSvc.Status.Router != nil {
+			llmSvc.Status.Router.Group = nil
+		}
 	}
 
 	// Collect any explicitly referenced HTTPRoutes
@@ -306,7 +334,14 @@ func (r *LLMISVCReconciler) updateRoutingStatus(ctx context.Context, llmSvc *v1a
 	logger := log.FromContext(ctx)
 
 	if utils.GetForceStopRuntime(llmSvc) {
+		var savedGroup *v1alpha2.GroupStatus
+		if llmSvc.Status.Router != nil {
+			savedGroup = llmSvc.Status.Router.Group
+		}
 		llmSvc.Status.Router = nil
+		if savedGroup != nil {
+			llmSvc.Status.Router = &v1alpha2.RouterStatus{Group: savedGroup}
+		}
 		llmSvc.Status.Address = nil //nolint:staticcheck // retained for schema compatibility
 		llmSvc.Status.Addresses = nil
 		llmSvc.MarkHTTPRoutesNotReady("Stopped", "Service is stopped")
@@ -355,9 +390,10 @@ func (r *LLMISVCReconciler) updateRoutingStatus(ctx context.Context, llmSvc *v1a
 	}
 
 	if len(routes) > 0 {
-		llmSvc.Status.Router = &v1alpha2.RouterStatus{
-			Gateways: BuildObservedGateways(routes),
+		if llmSvc.Status.Router == nil {
+			llmSvc.Status.Router = &v1alpha2.RouterStatus{}
 		}
+		llmSvc.Status.Router.Gateways = BuildObservedGateways(routes)
 	}
 
 	additional, err := r.discoverAdditionalURLs(ctx, discovered)
@@ -442,10 +478,26 @@ func RouterLabels(llmSvc *v1alpha2.LLMInferenceService) map[string]string {
 }
 
 func semanticHTTPRouteIsEqual(e *gwapiv1.HTTPRoute, c *gwapiv1.HTTPRoute) bool {
-	return equality.Semantic.DeepDerivative(e.Spec, c.Spec) &&
+	specEqual := equality.Semantic.DeepDerivative(e.Spec, c.Spec)
+	if isGroupRoute(e) {
+		// Grouped routes need exact rule comparison to detect stale backendRefs
+		// from deleted members. DeepDerivative only checks subset membership.
+		specEqual = equality.Semantic.DeepEqual(e.Spec.Rules, c.Spec.Rules) &&
+			equality.Semantic.DeepDerivative(e.Spec.ParentRefs, c.Spec.ParentRefs) &&
+			equality.Semantic.DeepDerivative(e.Spec.Hostnames, c.Spec.Hostnames)
+	}
+	return specEqual &&
 		equality.Semantic.DeepDerivative(e.Labels, c.Labels) &&
 		!hasStaleControllerLabels(e.Labels, c.Labels) &&
 		equality.Semantic.DeepDerivative(e.Annotations, c.Annotations)
+}
+
+func isGroupRoute(route *gwapiv1.HTTPRoute) bool {
+	if route == nil || route.Labels == nil {
+		return false
+	}
+	_, hasGroupLabel := route.Labels[constants.LLMRoutingGroupLabelKey]
+	return hasGroupLabel
 }
 
 // hasStaleControllerLabels returns true when the current object carries a
@@ -645,6 +697,9 @@ func (r *LLMISVCReconciler) EvaluateInferencePoolConditions(ctx context.Context,
 	if llmSvc.Spec.Router == nil || llmSvc.Spec.Router.Scheduler == nil {
 		logger.V(2).Info("Scheduler is disabled, clearing InferencePoolReady condition")
 		llmSvc.MarkInferencePoolReadyUnset()
+		if llmSvc.Status.Router != nil {
+			llmSvc.Status.Router.Scheduler = nil
+		}
 		return nil
 	}
 

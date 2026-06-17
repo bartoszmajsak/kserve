@@ -366,6 +366,10 @@ func GetFailConditions(svc *v1alpha2.LLMInferenceService) string {
 func (r *LLMISVCReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	logger := mgr.GetLogger().WithName("LLMInferenceService.SetupWithManager")
 
+	if err := setupGroupFieldIndex(context.Background(), mgr.GetFieldIndexer()); err != nil {
+		return fmt.Errorf("failed to set up field indexer for routing group: %w", err)
+	}
+
 	b := ctrl.NewControllerManagedBy(mgr).
 		For(&v1alpha2.LLMInferenceService{}).
 		Watches(&v1alpha2.LLMInferenceServiceConfig{}, r.enqueueOnLLMInferenceServiceConfigChange(logger)).
@@ -379,6 +383,12 @@ func (r *LLMISVCReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&corev1.Pod{},
 			handler.EnqueueRequestsFromMapFunc(r.EnqueueOnLLMInferenceServicePods),
 			builder.WithPredicates(PodStatusPredicate()))
+
+	b = b.Watches(
+		&v1alpha2.LLMInferenceService{},
+		&groupMemberEventHandler{reconciler: r},
+		builder.WithPredicates(groupMemberChangePredicate()),
+	)
 
 	if err := r.extendControllerSetup(mgr, b); err != nil {
 		return fmt.Errorf("failed to extend controller setup: %w", err)

@@ -48,6 +48,20 @@ func (r *RouterSpec) HasGroup() bool {
 	return r != nil && r.Route != nil && r.Route.Group != nil
 }
 
+func (r *RouterSpec) Group() *string {
+	if r == nil || r.Route == nil {
+		return nil
+	}
+	return r.Route.Group
+}
+
+func (r *RouterSpec) Weight() *int32 {
+	if r == nil || r.Route == nil {
+		return nil
+	}
+	return r.Route.Weight
+}
+
 func (in *GatewaySpec) HasRefs() bool {
 	return in != nil && len(in.Refs) > 0
 }

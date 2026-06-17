@@ -1,5 +1,6 @@
 /*
-Copyright 2025 The KServe Authors.
+Copyright 2026 The KServe Authors.
+
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -97,6 +98,91 @@ func TestSemanticHTTPRouteIsEqual_Labels(t *testing.T) {
 			expected: route(nil),
 			current:  route(nil),
 			wantEq:   true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.wantEq, semanticHTTPRouteIsEqual(tt.expected, tt.current))
+		})
+	}
+}
+
+func TestSemanticHTTPRouteIsEqual_GroupedRouteRules(t *testing.T) {
+	groupLabels := map[string]string{
+		constants.LLMRoutingGroupLabelKey: "llama-70b",
+	}
+
+	makeRule := func(path string, weight int32) gwapiv1.HTTPRouteRule {
+		return gwapiv1.HTTPRouteRule{
+			Matches: []gwapiv1.HTTPRouteMatch{
+				{Path: &gwapiv1.HTTPPathMatch{Value: &path}},
+			},
+			BackendRefs: []gwapiv1.HTTPBackendRef{
+				{BackendRef: gwapiv1.BackendRef{Weight: &weight}},
+			},
+		}
+	}
+
+	tests := []struct {
+		name     string
+		expected *gwapiv1.HTTPRoute
+		current  *gwapiv1.HTTPRoute
+		wantEq   bool
+	}{
+		{
+			name: "grouped route - identical rules - no update",
+			expected: &gwapiv1.HTTPRoute{
+				ObjectMeta: metav1.ObjectMeta{Labels: groupLabels},
+				Spec:       gwapiv1.HTTPRouteSpec{Rules: []gwapiv1.HTTPRouteRule{makeRule("/v1/chat", 9)}},
+			},
+			current: &gwapiv1.HTTPRoute{
+				ObjectMeta: metav1.ObjectMeta{Labels: groupLabels},
+				Spec:       gwapiv1.HTTPRouteSpec{Rules: []gwapiv1.HTTPRouteRule{makeRule("/v1/chat", 9)}},
+			},
+			wantEq: true,
+		},
+		{
+			name: "grouped route - stale backendRef in current (extra rule) - update",
+			expected: &gwapiv1.HTTPRoute{
+				ObjectMeta: metav1.ObjectMeta{Labels: groupLabels},
+				Spec:       gwapiv1.HTTPRouteSpec{Rules: []gwapiv1.HTTPRouteRule{makeRule("/v1/chat", 9)}},
+			},
+			current: &gwapiv1.HTTPRoute{
+				ObjectMeta: metav1.ObjectMeta{Labels: groupLabels},
+				Spec: gwapiv1.HTTPRouteSpec{Rules: []gwapiv1.HTTPRouteRule{
+					makeRule("/v1/chat", 9),
+					makeRule("/v1/chat", 1),
+				}},
+			},
+			wantEq: false,
+		},
+		{
+			name: "grouped route - weight changed - update",
+			expected: &gwapiv1.HTTPRoute{
+				ObjectMeta: metav1.ObjectMeta{Labels: groupLabels},
+				Spec:       gwapiv1.HTTPRouteSpec{Rules: []gwapiv1.HTTPRouteRule{makeRule("/v1/chat", 5)}},
+			},
+			current: &gwapiv1.HTTPRoute{
+				ObjectMeta: metav1.ObjectMeta{Labels: groupLabels},
+				Spec:       gwapiv1.HTTPRouteSpec{Rules: []gwapiv1.HTTPRouteRule{makeRule("/v1/chat", 9)}},
+			},
+			wantEq: false,
+		},
+		{
+			name: "non-grouped route - extra rule tolerated by DeepDerivative - no update",
+			expected: &gwapiv1.HTTPRoute{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{}},
+				Spec:       gwapiv1.HTTPRouteSpec{Rules: []gwapiv1.HTTPRouteRule{makeRule("/v1/chat", 9)}},
+			},
+			current: &gwapiv1.HTTPRoute{
+				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{}},
+				Spec: gwapiv1.HTTPRouteSpec{Rules: []gwapiv1.HTTPRouteRule{
+					makeRule("/v1/chat", 9),
+					makeRule("/v1/chat", 1),
+				}},
+			},
+			wantEq: true,
 		},
 	}
 
