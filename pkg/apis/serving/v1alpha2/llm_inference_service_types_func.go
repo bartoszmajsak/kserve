@@ -44,6 +44,10 @@ func (r *RouterSpec) EPPServiceName(llmSvc *LLMInferenceService) string {
 	return kmeta.ChildName(llmSvc.GetName(), "-epp-service")
 }
 
+func (r *RouterSpec) HasGroup() bool {
+	return r != nil && r.Route != nil && r.Route.Group != nil
+}
+
 func (in *GatewaySpec) HasRefs() bool {
 	return in != nil && len(in.Refs) > 0
 }

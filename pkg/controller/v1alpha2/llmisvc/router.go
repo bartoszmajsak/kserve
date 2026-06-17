@@ -430,17 +430,41 @@ func preferPathBasedURL(urls []DiscoveredURL, namespace, name string) *apis.URL 
 }
 
 func RouterLabels(llmSvc *v1alpha2.LLMInferenceService) map[string]string {
-	return map[string]string{
+	labels := map[string]string{
 		constants.KubernetesComponentLabelKey: constants.LLMComponentRouter,
 		constants.KubernetesAppNameLabelKey:   llmSvc.GetName(),
 		constants.KubernetesPartOfLabelKey:    constants.LLMInferenceServicePartOfValue,
 	}
+	if llmSvc.Spec.Router.HasGroup() {
+		labels[constants.LLMRoutingGroupLabelKey] = *llmSvc.Spec.Router.Route.Group
+	}
+	return labels
 }
 
 func semanticHTTPRouteIsEqual(e *gwapiv1.HTTPRoute, c *gwapiv1.HTTPRoute) bool {
 	return equality.Semantic.DeepDerivative(e.Spec, c.Spec) &&
 		equality.Semantic.DeepDerivative(e.Labels, c.Labels) &&
+		!hasStaleControllerLabels(e.Labels, c.Labels) &&
 		equality.Semantic.DeepDerivative(e.Annotations, c.Annotations)
+}
+
+// hasStaleControllerLabels returns true when the current object carries a
+// controller-managed label that the expected object does not. DeepDerivative
+// alone misses this case because it only checks that expected is a subset of
+// current - it never flags removals.
+func hasStaleControllerLabels(expected, current map[string]string) bool {
+	for _, key := range controllerManagedLabelKeys {
+		_, inCurrent := current[key]
+		_, inExpected := expected[key]
+		if inCurrent && !inExpected {
+			return true
+		}
+	}
+	return false
+}
+
+var controllerManagedLabelKeys = []string{
+	constants.LLMRoutingGroupLabelKey,
 }
 
 // EvaluateGatewayConditions evaluates the readiness of all Gateways referenced by the LLMInferenceService

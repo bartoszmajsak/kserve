@@ -14168,6 +14168,11 @@ spec:
                     type: object
                   route:
                     properties:
+                      group:
+                        maxLength: 63
+                        minLength: 1
+                        pattern: ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$
+                        type: string
                       http:
                         properties:
                           refs:
@@ -15689,6 +15694,11 @@ spec:
                                 type: string
                             type: object
                         type: object
+                      weight:
+                        format: int32
+                        maximum: 1000000
+                        minimum: 0
+                        type: integer
                     type: object
                   scheduler:
                     properties:
@@ -35336,6 +35346,11 @@ spec:
                     type: object
                   route:
                     properties:
+                      group:
+                        maxLength: 63
+                        minLength: 1
+                        pattern: ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$
+                        type: string
                       http:
                         properties:
                           refs:
@@ -36780,6 +36795,11 @@ spec:
                                 type: string
                             type: object
                         type: object
+                      weight:
+                        format: int32
+                        maximum: 1000000
+                        minimum: 0
+                        type: integer
                     type: object
                   scheduler:
                     properties:
@@ -56509,6 +56529,11 @@ spec:
                     type: object
                   route:
                     properties:
+                      group:
+                        maxLength: 63
+                        minLength: 1
+                        pattern: ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$
+                        type: string
                       http:
                         properties:
                           refs:
@@ -58031,6 +58056,11 @@ spec:
                                 type: string
                             type: object
                         type: object
+                      weight:
+                        format: int32
+                        maximum: 1000000
+                        minimum: 0
+                        type: integer
                     type: object
                   scheduler:
                     properties:
@@ -77873,6 +77903,11 @@ spec:
                     type: object
                   route:
                     properties:
+                      group:
+                        maxLength: 63
+                        minLength: 1
+                        pattern: ^[a-z0-9]([a-z0-9-]*[a-z0-9])?$
+                        type: string
                       http:
                         properties:
                           refs:
@@ -79395,6 +79430,11 @@ spec:
                                 type: string
                             type: object
                         type: object
+                      weight:
+                        format: int32
+                        maximum: 1000000
+                        minimum: 0
+                        type: integer
                     type: object
                   scheduler:
                     properties:
@@ -91285,6 +91325,63 @@ spec:
                       type: object
                     type: array
                     x-kubernetes-list-type: atomic
+                  group:
+                    properties:
+                      members:
+                        items:
+                          properties:
+                            backendRef:
+                              properties:
+                                group:
+                                  default: ""
+                                  maxLength: 253
+                                  pattern: ^$|^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                                  type: string
+                                kind:
+                                  default: Service
+                                  maxLength: 63
+                                  minLength: 1
+                                  pattern: ^[a-zA-Z]([-a-zA-Z0-9]*[a-zA-Z0-9])?$
+                                  type: string
+                                name:
+                                  maxLength: 253
+                                  minLength: 1
+                                  type: string
+                                namespace:
+                                  maxLength: 63
+                                  minLength: 1
+                                  pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                                  type: string
+                                port:
+                                  format: int32
+                                  maximum: 65535
+                                  minimum: 1
+                                  type: integer
+                              required:
+                              - name
+                              type: object
+                              x-kubernetes-validations:
+                              - message: Must have port for Service reference
+                                rule: '(size(self.group) == 0 && self.kind == ''Service'')
+                                  ? has(self.port) : true'
+                            name:
+                              type: string
+                            weight:
+                              format: int32
+                              type: integer
+                          required:
+                          - name
+                          - weight
+                          type: object
+                        type: array
+                        x-kubernetes-list-map-keys:
+                        - name
+                        x-kubernetes-list-type: map
+                      name:
+                        type: string
+                    required:
+                    - name
+                    type: object
                   scheduler:
                     properties:
                       inferencePool:

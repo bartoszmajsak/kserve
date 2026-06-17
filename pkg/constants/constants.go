@@ -447,6 +447,12 @@ const (
 	LLMComponentInference             = "inference" // used in sample/template resources
 )
 
+// LLMInferenceService routing group label
+const (
+	// LLMRoutingGroupLabelKey identifies which traffic splitting group an LLMInferenceService belongs to.
+	LLMRoutingGroupLabelKey = "serving.kserve.io/routing-group"
+)
+
 // LLMInferenceService constants
 const (
 	// LLMISVCRoutingSidecarContainerName is the name of the routing sidecar container

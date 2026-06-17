@@ -104,6 +104,20 @@ const (
 	// created and is ready. Set by the router reconciler.
 	// Only present when the scheduler is enabled.
 	InferencePoolReady apis.ConditionType = "InferencePoolReady"
+
+	// TrafficGroupReady is True when the routing group is healthy and all
+	// members have valid backends. False with reason ModelNameMismatch when
+	// group members serve different model names, ModelNameAmbiguous when no
+	// strict majority exists, or BackendResolutionFailed when no members
+	// could be resolved.
+	// Only present when traffic splitting is configured (group + weight set).
+	TrafficGroupReady apis.ConditionType = "TrafficGroupReady"
+
+	// TrafficGroupDegraded is True when the group is serving but some members
+	// could not be resolved (e.g., broken baseRef configs). Traffic splitting
+	// continues with available members. False (or unset) when fully healthy.
+	// Only present when traffic splitting is configured (group + weight set).
+	TrafficGroupDegraded apis.ConditionType = "TrafficGroupDegraded"
 )
 
 var llmInferenceServiceCondSet = apis.NewLivingConditionSet(
@@ -277,12 +291,35 @@ func (in *LLMInferenceService) MarkInferencePoolReadyUnset() {
 	_ = in.GetConditionSet().Manage(in.GetStatus()).ClearCondition(InferencePoolReady)
 }
 
+func (in *LLMInferenceService) MarkTrafficGroupReady() {
+	in.GetConditionSet().Manage(in.GetStatus()).MarkTrue(TrafficGroupReady)
+}
+
+func (in *LLMInferenceService) MarkTrafficGroupNotReady(reason, messageFormat string, messageA ...interface{}) {
+	in.GetConditionSet().Manage(in.GetStatus()).MarkFalse(TrafficGroupReady, reason, messageFormat, messageA...)
+	_ = in.GetConditionSet().Manage(in.GetStatus()).ClearCondition(TrafficGroupDegraded)
+}
+
+func (in *LLMInferenceService) MarkTrafficGroupReadyUnset() {
+	_ = in.GetConditionSet().Manage(in.GetStatus()).ClearCondition(TrafficGroupReady)
+	_ = in.GetConditionSet().Manage(in.GetStatus()).ClearCondition(TrafficGroupDegraded)
+}
+
+func (in *LLMInferenceService) MarkTrafficGroupDegraded(reason, messageFormat string, messageA ...interface{}) {
+	in.GetConditionSet().Manage(in.GetStatus()).MarkTrueWithReason(TrafficGroupDegraded, reason, messageFormat, messageA...)
+}
+
+func (in *LLMInferenceService) MarkTrafficGroupNotDegraded() {
+	_ = in.GetConditionSet().Manage(in.GetStatus()).ClearCondition(TrafficGroupDegraded)
+}
+
 func (in *LLMInferenceService) DetermineRouterReadiness() {
 	subConditions := []*apis.Condition{
 		in.GetStatus().GetCondition(GatewaysReady),
 		in.GetStatus().GetCondition(HTTPRoutesReady),
 		in.GetStatus().GetCondition(InferencePoolReady),
 		in.GetStatus().GetCondition(SchedulerWorkloadReady),
+		in.GetStatus().GetCondition(TrafficGroupReady),
 	}
 
 	for _, cond := range subConditions {
