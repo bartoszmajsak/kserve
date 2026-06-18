@@ -21,6 +21,7 @@ import (
 	"context"
 	"fmt"
 	"slices"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -433,12 +434,34 @@ func rewriteRulesForGroup(route *gwapiv1.HTTPRoute, llmSvc *v1alpha2.LLMInferenc
 		})
 	}
 
+	perParticipantPrefix := "/" + llmSvc.Namespace + "/" + llmSvc.Name
+
 	for i := range route.Spec.Rules {
+		if isPerParticipantRule(route.Spec.Rules[i], perParticipantPrefix) {
+			continue
+		}
 		if !hasControllerManagedBackendRef(route.Spec.Rules[i], llmSvc) {
 			continue
 		}
 		route.Spec.Rules[i].BackendRefs = slices.Clone(allBackendRefs)
 	}
+}
+
+// isPerParticipantRule returns true for rules whose path matches the
+// per-participant pattern (/{namespace}/{name}/...). These are direct-access
+// routes unique to this member and should not get weighted group backendRefs.
+func isPerParticipantRule(rule gwapiv1.HTTPRouteRule, perParticipantPrefix string) bool {
+	for _, match := range rule.Matches {
+		if match.Path == nil || match.Path.Value == nil {
+			continue
+		}
+		path := *match.Path.Value
+		if path == perParticipantPrefix ||
+			strings.HasPrefix(path, perParticipantPrefix+"/") {
+			return true
+		}
+	}
+	return false
 }
 
 // hasControllerManagedBackendRef returns true if any backendRef in the rule is
