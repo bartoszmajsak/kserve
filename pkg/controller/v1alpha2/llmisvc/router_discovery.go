@@ -258,13 +258,13 @@ func extractRoutePaths(route *gwapiv1.HTTPRoute, modelRoutingHeader string) []st
 		servicePaths []string
 		otherPaths   []string
 	}
-	// We keep two separate buckets because the two access methods produce
-	// different "base URL" paths that must both appear in the status:
-	//  - pathBased  → /{namespace}/{name} (the original routing scheme)
-	//  - modelRouting → / (reachable only with the model-routing header)
-	// Mixing them into one list would let the model-routing "/" shadow the
-	// deeper path-based URL, which breaks backward-compatible discovery.
-	var pathBased, modelRouting pathBucket
+	// We keep three separate buckets because each access method produces
+	// a different "base URL" path that must appear in status:
+	//  - pathBased     → /{namespace}/{name} (per-participant, version-specific)
+	//  - publisherPath → /publishers/{ns}/models/{model-name} (stable across versions)
+	//  - modelRouting  → / (reachable only with the model-routing header)
+	// Mixing them would let shallower paths shadow deeper ones.
+	var pathBased, publisherPath, modelRouting pathBucket
 
 	for _, rule := range route.Spec.Rules {
 		svc := hasServiceBackend(rule)
@@ -275,11 +275,22 @@ func extractRoutePaths(route *gwapiv1.HTTPRoute, modelRoutingHeader string) []st
 			}
 
 			if len(match.Headers) == 0 {
-				// Traditional path-only match — always collected.
-				if svc {
-					pathBased.servicePaths = append(pathBased.servicePaths, p)
+				if strings.HasPrefix(p, "/publishers/") {
+					// Publisher-qualified model path — stable across versions.
+					// The /publishers/ prefix is reserved for controller-managed
+					// model-level routes and must not be used for custom paths.
+					if svc {
+						publisherPath.servicePaths = append(publisherPath.servicePaths, p)
+					} else {
+						publisherPath.otherPaths = append(publisherPath.otherPaths, p)
+					}
 				} else {
-					pathBased.otherPaths = append(pathBased.otherPaths, p)
+					// Traditional path-only match — per-participant.
+					if svc {
+						pathBased.servicePaths = append(pathBased.servicePaths, p)
+					} else {
+						pathBased.otherPaths = append(pathBased.otherPaths, p)
+					}
 				}
 			} else if isModelBasedRoutingMatch(match, modelRoutingHeader) {
 				// Model-based routing match — collected only when the header
@@ -318,6 +329,9 @@ func extractRoutePaths(route *gwapiv1.HTTPRoute, modelRoutingHeader string) []st
 
 	var result []string
 	if p := shallowest(pathBased); p != "" {
+		result = append(result, p)
+	}
+	if p := shallowest(publisherPath); p != "" {
 		result = append(result, p)
 	}
 	if p := shallowest(modelRouting); p != "" {

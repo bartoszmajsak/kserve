@@ -561,9 +561,7 @@ var _ = Describe("LLMInferenceService Group Routing", func() {
 		})
 	})
 
-	// Force-stop grouped member test is in PR-A3 (force-stop status preservation)
-
-	PContext("Force-stop grouped member", func() {
+	Context("Force-stop grouped member", func() {
 		It("should set weight to 0 for a force-stopped member while preserving group status", func(ctx SpecContext) {
 			// given
 			groupName := "stop-group"

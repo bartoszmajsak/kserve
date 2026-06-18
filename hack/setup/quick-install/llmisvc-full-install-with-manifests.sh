@@ -4342,6 +4342,7 @@ spec:
             timeouts:
               backendRequest: 0s
               request: 0s
+          - name: v1-messages-path
           - backendRefs:
             - group: inference.networking.k8s.io
               kind: InferencePool
@@ -4357,8 +4358,10 @@ spec:
             matches:
             - path:
                 type: PathPrefix
-                value: /{{ .ObjectMeta.Namespace }}/{{ .ObjectMeta.Name }}/v1/messages
-            name: v1-messages-path
+                value: |-
+                  /{{ .ObjectMeta.Namespace }}/{{ .ObjectMeta.Name }}/v1/messages
+                  /publishers/{{ .ObjectMeta.Namespace }}/models/{{ .Spec.Model.Name }}
+            name: v1-publisher-path-catch-all
             timeouts:
               backendRequest: 0s
               request: 0s
@@ -4379,6 +4382,7 @@ spec:
                 value: /v1/messages
             - headers:
               - name: '{{ .GlobalConfig.ModelBasedRoutingHeaderName }}'
+                replacePrefixMatch: /
                 type: Exact
                 value: publishers/{{ .ObjectMeta.Namespace }}/models/{{ .Spec.Model.Name
                   }}
