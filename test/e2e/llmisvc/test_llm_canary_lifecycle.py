@@ -760,6 +760,7 @@ class TestCanaryLifecycle:
                 "Content-Type": "application/json",
             },
             {"model": MODEL, "prompt": "Hello", "max_tokens": 5},
+            consecutive=8,
         )
         driver.mark("promote")
         time.sleep(20)
