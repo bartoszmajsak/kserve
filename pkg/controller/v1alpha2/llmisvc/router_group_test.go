@@ -559,6 +559,47 @@ func TestTrafficFieldsChanged(t *testing.T) {
 			want: false,
 		},
 		{
+			// Peers derive group membership from a member's resolved model
+			// identity (status.addresses[].models), not just spec. When a
+			// divergent model name is fixed, the corrected name surfaces via a
+			// status-only write - peers must be re-enqueued to re-evaluate
+			// divergence and clear GroupDegraded.
+			name: "resolved model name changed in status",
+			old: func() *v1alpha2.LLMInferenceService {
+				s := memberSvc("v1", "g", 9, false, now)
+				s.Status.Addresses = []v1alpha2.SourcedAddress{
+					{Models: []v1alpha2.ModelSourcedAddressStatus{{Name: "model-beta"}}},
+				}
+				return &s
+			}(),
+			new: func() *v1alpha2.LLMInferenceService {
+				s := memberSvc("v1", "g", 9, false, now)
+				s.Status.Addresses = []v1alpha2.SourcedAddress{
+					{Models: []v1alpha2.ModelSourcedAddressStatus{{Name: "model-alpha"}}},
+				}
+				return &s
+			}(),
+			want: true,
+		},
+		{
+			name: "resolved model identity unchanged (spec matches status)",
+			old: func() *v1alpha2.LLMInferenceService {
+				s := memberSvc("v1", "g", 9, false, now)
+				s.Status.Addresses = []v1alpha2.SourcedAddress{
+					{Models: []v1alpha2.ModelSourcedAddressStatus{{Name: "llama-70b"}}},
+				}
+				return &s
+			}(),
+			new: func() *v1alpha2.LLMInferenceService {
+				s := memberSvc("v1", "g", 9, false, now)
+				s.Status.Addresses = []v1alpha2.SourcedAddress{
+					{Models: []v1alpha2.ModelSourcedAddressStatus{{Name: "llama-70b"}}},
+				}
+				return &s
+			}(),
+			want: false,
+		},
+		{
 			name: "non-traffic change on grouped member",
 			old:  func() *v1alpha2.LLMInferenceService { s := memberSvc("v1", "g", 9, false, now); return &s }(),
 			new:  func() *v1alpha2.LLMInferenceService { s := memberSvc("v1", "g", 9, false, now); return &s }(),

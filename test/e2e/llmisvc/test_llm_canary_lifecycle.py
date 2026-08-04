@@ -504,7 +504,13 @@ def get_member_status(api, observer, member, ns):
 
 
 def wait_for_healthy_route(
-    gateway_url, headers, payload, consecutive=10, timeout=60, expect_header=None
+    gateway_url,
+    headers,
+    payload,
+    consecutive=10,
+    timeout=60,
+    expect_header=None,
+    settle=5.0,
 ):
     """Poll the gateway until we get consecutive 2xx responses.
 
@@ -512,6 +518,11 @@ def wait_for_healthy_route(
     has fully propagated. When expect_header is set as (name, prefix),
     also validates the response header value starts with the given prefix
     to confirm the correct backend is serving.
+
+    The consecutive-2xx probe uses fresh connections, so it can go green
+    while xDS is still settling on other workers/routes. After the streak
+    is met, wait `settle`s so this residual reprogramming churn lands before
+    the caller's stable-phase mark rather than inside the asserted phase.
     """
     streak = 0
     deadline = time.monotonic() + timeout
@@ -527,6 +538,7 @@ def wait_for_healthy_route(
                         continue
                 streak += 1
                 if streak >= consecutive:
+                    time.sleep(settle)
                     return
             else:
                 streak = 0
@@ -856,8 +868,12 @@ class TestCanaryLifecycle:
                 f"{phase.summary()}"
             )
 
-        # --- Zero errors in stable phases. A 5s gateway convergence delay
-        # after each mutation excludes transient 500s during route programming. ---
+        # --- Zero errors in stable phases. Each phase mark is placed only after
+        # wait_for_healthy_route confirms N consecutive 2xx from the expected
+        # backend AND waits a settle buffer, so the transient route-programming
+        # window after a mutation falls in the *_mutation phase, not the stable
+        # one asserted here. Error samples carry x-inference-pod + offset to
+        # attribute any leak (see Slice.summary). ---
         for name in ["baseline", "canary", "promote"]:
             report.phase(name).assert_no_errors(f"stable phase: {name}")
 
