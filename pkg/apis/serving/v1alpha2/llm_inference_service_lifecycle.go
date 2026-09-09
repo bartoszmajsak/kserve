@@ -244,7 +244,7 @@ func (in *LLMInferenceService) DetermineWorkloadReadiness() {
 			continue
 		}
 		if cond.IsFalse() {
-			in.GetConditionSet().Manage(in.GetStatus()).MarkFalse(WorkloadReady, cond.Reason, cond.Message)
+			in.GetConditionSet().Manage(in.GetStatus()).MarkFalse(WorkloadReady, cond.Reason, "%s", cond.Message)
 			return
 		}
 	}
@@ -361,7 +361,7 @@ func (in *LLMInferenceService) DetermineRouterReadiness() {
 			continue
 		}
 		if cond.IsFalse() {
-			in.GetConditionSet().Manage(in.GetStatus()).MarkFalse(RouterReady, cond.Reason, cond.Message)
+			in.GetConditionSet().Manage(in.GetStatus()).MarkFalse(RouterReady, cond.Reason, "%s", cond.Message)
 			return
 		}
 	}

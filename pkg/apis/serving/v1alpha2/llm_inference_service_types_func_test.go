@@ -20,6 +20,7 @@ import (
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"knative.dev/pkg/apis"
@@ -839,4 +840,33 @@ func TestManagedDRAContainerName(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestDetermineReadiness_MessageIsNotReformatted(t *testing.T) {
+	// An API server validation message quoting a regex. Rolling it up must not run it
+	// through a second round of formatting, or the operator reads %!&(MISSING) where
+	// the pattern they have to satisfy should be.
+	const apiServerMessage = `must match "^[A-Za-z0-9!#$%&'*+\-.^_|~]+$"`
+
+	t.Run("RouterReady", func(t *testing.T) {
+		svc := newTestLLMISVC()
+		svc.MarkHTTPRoutesNotReady("HTTPRouteReconcileError", "%s", apiServerMessage)
+
+		svc.DetermineRouterReadiness()
+
+		cond := svc.GetStatus().GetCondition(RouterReady)
+		require.NotNil(t, cond)
+		assert.Equal(t, apiServerMessage, cond.Message)
+	})
+
+	t.Run("WorkloadReady", func(t *testing.T) {
+		svc := newTestLLMISVC()
+		svc.MarkMainWorkloadNotReady("DeploymentFailed", "%s", apiServerMessage)
+
+		svc.DetermineWorkloadReadiness()
+
+		cond := svc.GetStatus().GetCondition(WorkloadReady)
+		require.NotNil(t, cond)
+		assert.Equal(t, apiServerMessage, cond.Message)
+	})
 }
