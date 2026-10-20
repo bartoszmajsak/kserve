@@ -75,7 +75,7 @@ func keepPerModelPaths(reason, message string) perModelPathsDecision {
 // route in place. It runs after the model-routing transform, so a route whose
 // model-routing matches were stripped keeps its paths.
 func (r *LLMISVCReconciler) applyModelBasedRoutingOnly(ctx context.Context, llmSvc *v1alpha2.LLMInferenceService, cfg *Config, route *gwapiv1.HTTPRoute) (perModelPathsDecision, error) {
-	decision, err := r.resolveModelBasedRoutingOnly(ctx, llmSvc, route)
+	decision, err := r.resolveModelBasedRoutingOnly(ctx, llmSvc, cfg, route)
 	if err != nil || !decision.drop {
 		return decision, err
 	}
@@ -83,7 +83,7 @@ func (r *LLMISVCReconciler) applyModelBasedRoutingOnly(ctx context.Context, llmS
 		// The configured spec having model-routing matches that the rendered
 		// route lacks means the model-routing transform stripped them.
 		if cfg.ModelBasedRoutingHeaderName == "" || hasModelRoutingMatch(llmSvc.Spec.Router.Route.HTTP.Spec.Rules, cfg.ModelBasedRoutingHeaderName) {
-			return keepPerModelPaths(reasonModelBasedRoutingNotEnabled, AnnotationModelBasedRoutingOnly+" is set, but model-based routing is not enabled for the service; per-model path matches are kept"), nil
+			return keepPerModelPaths(reasonModelBasedRoutingNotEnabled, AnnotationModelBasedRoutingOnly+" is set, but model-based routing is not enabled for the LLMInferenceService; per-model path matches are kept"), nil
 		}
 		return keepPerModelPaths(reasonNoModelRoutingMatches, AnnotationModelBasedRoutingOnly+" is set, but the route has no model-routing matches to fall back on; per-model path matches are kept"), nil
 	}
@@ -95,12 +95,19 @@ func (r *LLMISVCReconciler) applyModelBasedRoutingOnly(ctx context.Context, llmS
 // matches, before checking there is a model-routing tree to fall back on. An
 // explicit service value wins, then the parent Gateways decide (see
 // AnnotationModelBasedRoutingOnly). A service "false" reads the Gateways only
-// to report an override; a failed read there leaves it unreported.
-func (r *LLMISVCReconciler) resolveModelBasedRoutingOnly(ctx context.Context, llmSvc *v1alpha2.LLMInferenceService, route *gwapiv1.HTTPRoute) (perModelPathsDecision, error) {
+// to report an override; a failed read there leaves it unreported. Messages
+// about the service value name the config it came from, as recorded in
+// Config.ModelBasedRoutingOnlyDeclaredBy.
+func (r *LLMISVCReconciler) resolveModelBasedRoutingOnly(ctx context.Context, llmSvc *v1alpha2.LLMInferenceService, cfg *Config, route *gwapiv1.HTTPRoute) (perModelPathsDecision, error) {
 	value := llmSvc.Spec.Annotations[AnnotationModelBasedRoutingOnly]
+	source := cfg.ModelBasedRoutingOnlyDeclaredBy
+	if source == "" {
+		source = "the LLMInferenceService"
+	}
 	onService, recognized := parseModelBasedRoutingOnly(value)
 	if recognized && onService {
-		return dropPerModelPaths(reasonSetOnService, AnnotationModelBasedRoutingOnly+" is true on the service or its preset; per-model path matches are dropped"), nil
+		return dropPerModelPaths(reasonSetOnService, fmt.Sprintf(
+			"%s is true on %s; per-model path matches are dropped", AnnotationModelBasedRoutingOnly, source)), nil
 	}
 
 	parents := r.readParentGateways(ctx, route)
@@ -109,8 +116,8 @@ func (r *LLMISVCReconciler) resolveModelBasedRoutingOnly(ctx context.Context, ll
 			return perModelPathsDecision{}, nil
 		}
 		return keepPerModelPaths(reasonDisabledOnService, fmt.Sprintf(
-			"%s is false on the service or its preset, overriding parent Gateways %s; per-model path matches are kept",
-			AnnotationModelBasedRoutingOnly, strings.Join(parents.set, ", "))), nil
+			"%s is false on %s, overriding parent Gateways %s; per-model path matches are kept",
+			AnnotationModelBasedRoutingOnly, source, strings.Join(parents.set, ", "))), nil
 	}
 
 	switch {
@@ -120,7 +127,7 @@ func (r *LLMISVCReconciler) resolveModelBasedRoutingOnly(ctx context.Context, ll
 		return dropPerModelPaths(reasonSetOnAllGateways, AnnotationModelBasedRoutingOnly+" is true on every parent Gateway; per-model path matches are dropped"), nil
 	case value != "":
 		return keepPerModelPaths(reasonUnrecognizedValue, fmt.Sprintf(
-			"%s has the unrecognized value %q on the service or its preset; per-model path matches are kept", AnnotationModelBasedRoutingOnly, value)), nil
+			"%s has the unrecognized value %q on %s; per-model path matches are kept", AnnotationModelBasedRoutingOnly, value, source)), nil
 	case len(parents.set) > 0:
 		return keepPerModelPaths(reasonNotSetOnAllGateways, fmt.Sprintf(
 			"%s is not true on parent Gateways %s; per-model path matches are kept",

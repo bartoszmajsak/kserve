@@ -940,6 +940,109 @@ func TestCombineBaseRefsConfig_ServiceWinsOverBaseRef(t *testing.T) {
 	assert.NotContains(t, cmd, "--tensor-parallel-size 2")
 }
 
+// The PerModelPathsDropped message names the object behind a service-level
+// model-based-routing-only value, which the merged spec no longer shows.
+func TestCombineBaseRefsConfig_RecordsModelBasedRoutingOnlySource(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, corev1.AddToScheme(scheme))
+	require.NoError(t, v1alpha2.AddToScheme(scheme))
+
+	const namespace = "test-ns"
+
+	// Every baseRef writes the key, even with an empty value; an empty template
+	// or service value leaves it out.
+	type setting struct{ config, value string }
+	tests := []struct {
+		name     string
+		template string
+		baseRefs []setting
+		service  string
+		want     string
+	}{
+		{
+			name: "not set anywhere",
+			want: "",
+		},
+		{
+			name:     "set by a baseRef",
+			baseRefs: []setting{{"routing-only", "true"}},
+			want:     "LLMInferenceServiceConfig test-ns/routing-only",
+		},
+		{
+			name:     "the service overrides its baseRef",
+			baseRefs: []setting{{"routing-only", "true"}},
+			service:  "false",
+			want:     "",
+		},
+		{
+			name:     "the later baseRef overrides the earlier one",
+			baseRefs: []setting{{"first", "true"}, {"second", "false"}},
+			want:     "LLMInferenceServiceConfig test-ns/second",
+		},
+		{
+			name:     "an empty value is not a source",
+			baseRefs: []setting{{"first", "true"}, {"second", ""}},
+			want:     "LLMInferenceServiceConfig test-ns/first",
+		},
+		{
+			name:     "set by the well-known template",
+			template: "true",
+			want:     "LLMInferenceServiceConfig test-ns/" + configTemplateName,
+		},
+		{
+			name:     "a baseRef overrides the well-known template",
+			template: "true",
+			baseRefs: []setting{{"routing-only", "false"}},
+			want:     "LLMInferenceServiceConfig test-ns/routing-only",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			// given
+			template := loadPresetConfig(t, "config-llm-template.yaml")
+			template.Namespace = namespace
+			if tt.template != "" {
+				if template.Spec.Annotations == nil {
+					template.Spec.Annotations = map[string]string{}
+				}
+				template.Spec.Annotations[AnnotationModelBasedRoutingOnly] = tt.template
+			}
+			objs := []client.Object{template}
+
+			llmSvc := &v1alpha2.LLMInferenceService{
+				ObjectMeta: metav1.ObjectMeta{Name: "test-llm", Namespace: namespace},
+				Spec: v1alpha2.LLMInferenceServiceSpec{
+					Model: v1alpha2.LLMModelSpec{Name: ptr.To("test-model")},
+				},
+			}
+			if tt.service != "" {
+				llmSvc.Spec.Annotations = map[string]string{AnnotationModelBasedRoutingOnly: tt.service}
+			}
+			for _, ref := range tt.baseRefs {
+				cfg := &v1alpha2.LLMInferenceServiceConfig{
+					ObjectMeta: metav1.ObjectMeta{Name: ref.config, Namespace: namespace},
+				}
+				cfg.Spec.Annotations = map[string]string{AnnotationModelBasedRoutingOnly: ref.value}
+				objs = append(objs, cfg)
+				llmSvc.Spec.BaseRefs = append(llmSvc.Spec.BaseRefs, corev1.LocalObjectReference{Name: ref.config})
+			}
+
+			reconciler := &LLMISVCReconciler{
+				Client: fake.NewClientBuilder().WithScheme(scheme).WithObjects(objs...).Build(),
+			}
+
+			// when
+			cfg := &Config{}
+			_, err := reconciler.combineBaseRefsConfig(t.Context(), llmSvc, cfg)
+
+			// then
+			require.NoError(t, err)
+			assert.Equal(t, tt.want, cfg.ModelBasedRoutingOnlyDeclaredBy)
+		})
+	}
+}
+
 // TestCombineBaseRefsConfig_RendersAgainstCanonicalPreRenderSpec verifies the
 // interface invariant that templates observe the canonical merged spec immediately
 // before rendering. That includes merge-keyed list ordering and values contributed

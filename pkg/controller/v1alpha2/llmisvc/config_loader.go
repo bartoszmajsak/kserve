@@ -186,6 +186,13 @@ type Config struct {
 	// share a single consistent result.
 	ResolvedLoRAAdapters []resolvedLoRAAdapter `json:"-"`
 
+	// ModelBasedRoutingOnlyDeclaredBy names the config that supplied the merged
+	// spec.annotations value of AnnotationModelBasedRoutingOnly; empty when the
+	// service's own spec did. Populated inside combineBaseRefsConfig, like
+	// ResolvedLoRAAdapters: the merged spec no longer shows where a value came
+	// from, and the PerModelPathsDropped message names it.
+	ModelBasedRoutingOnlyDeclaredBy string `json:"-"`
+
 	// ModelExpress is the ModelExpress setup resolved for this reconcile, or nil
 	// when the service does not use ModelExpress.
 	ModelExpress *modelExpressConfig `json:"-"`

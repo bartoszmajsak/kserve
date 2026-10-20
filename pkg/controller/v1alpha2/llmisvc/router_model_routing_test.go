@@ -339,6 +339,7 @@ func TestResolveModelBasedRoutingOnly(t *testing.T) {
 	tests := []struct {
 		name           string
 		serviceSetting string
+		declaredBy     string
 		gateways       []*gwapiv1.Gateway
 		parents        []gwapiv1.ParentReference
 		want           perModelPathsDecision
@@ -360,6 +361,14 @@ func TestResolveModelBasedRoutingOnly(t *testing.T) {
 			serviceSetting: "true",
 			parents:        []gwapiv1.ParentReference{parent("gw-ns", "gw-missing")},
 			want:           perModelPathsDecision{configured: true, drop: true, reason: reasonSetOnService},
+			wantMessage:    "is true on the LLMInferenceService;",
+		},
+		{
+			name:           "service true from a preset names the preset",
+			serviceSetting: "true",
+			declaredBy:     "LLMInferenceServiceConfig ns/routing-only",
+			want:           perModelPathsDecision{configured: true, drop: true, reason: reasonSetOnService},
+			wantMessage:    "is true on LLMInferenceServiceConfig ns/routing-only;",
 		},
 		{
 			name:           "service value is parsed leniently",
@@ -412,7 +421,16 @@ func TestResolveModelBasedRoutingOnly(t *testing.T) {
 			gateways:       []*gwapiv1.Gateway{gateway("gw-ns", "gw-a", "true")},
 			parents:        []gwapiv1.ParentReference{parent("gw-ns", "gw-a")},
 			want:           perModelPathsDecision{configured: true, reason: reasonDisabledOnService},
-			wantMessage:    "overriding parent Gateways gw-ns/gw-a;",
+			wantMessage:    "is false on the LLMInferenceService, overriding parent Gateways gw-ns/gw-a;",
+		},
+		{
+			name:           "service false from a preset names the preset",
+			serviceSetting: "false",
+			declaredBy:     "LLMInferenceServiceConfig ns/routing-only",
+			gateways:       []*gwapiv1.Gateway{gateway("gw-ns", "gw-a", "true")},
+			parents:        []gwapiv1.ParentReference{parent("gw-ns", "gw-a")},
+			want:           perModelPathsDecision{configured: true, reason: reasonDisabledOnService},
+			wantMessage:    "is false on LLMInferenceServiceConfig ns/routing-only, overriding",
 		},
 		{
 			name:           "service false with no Gateway asking is not reported",
@@ -440,7 +458,16 @@ func TestResolveModelBasedRoutingOnly(t *testing.T) {
 			gateways:       []*gwapiv1.Gateway{gateway("gw-ns", "gw-a", "true"), gateway("gw-ns", "gw-b", "")},
 			parents:        []gwapiv1.ParentReference{parent("gw-ns", "gw-a"), parent("gw-ns", "gw-b")},
 			want:           perModelPathsDecision{configured: true, reason: reasonUnrecognizedValue},
-			wantMessage:    `unrecognized value "yes"`,
+			wantMessage:    `unrecognized value "yes" on the LLMInferenceService;`,
+		},
+		{
+			name:           "unrecognized service value from a preset names the preset",
+			serviceSetting: "yes",
+			declaredBy:     "LLMInferenceServiceConfig ns/routing-only",
+			gateways:       []*gwapiv1.Gateway{gateway("gw-ns", "gw-b", "")},
+			parents:        []gwapiv1.ParentReference{parent("gw-ns", "gw-b")},
+			want:           perModelPathsDecision{configured: true, reason: reasonUnrecognizedValue},
+			wantMessage:    `unrecognized value "yes" on LLMInferenceServiceConfig ns/routing-only;`,
 		},
 		{
 			name:     "unreadable Gateway with no unset parent is returned, not defaulted",
@@ -477,7 +504,7 @@ func TestResolveModelBasedRoutingOnly(t *testing.T) {
 				llmSvc.Spec.Annotations = map[string]string{AnnotationModelBasedRoutingOnly: tt.serviceSetting}
 			}
 
-			got, err := r.resolveModelBasedRoutingOnly(t.Context(), llmSvc, route)
+			got, err := r.resolveModelBasedRoutingOnly(t.Context(), llmSvc, &Config{ModelBasedRoutingOnlyDeclaredBy: tt.declaredBy}, route)
 			if tt.wantErr {
 				require.Error(t, err)
 				return

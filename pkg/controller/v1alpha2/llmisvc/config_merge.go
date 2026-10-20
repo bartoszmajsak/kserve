@@ -730,6 +730,7 @@ func (r *LLMISVCReconciler) combineBaseRefsConfig(ctx context.Context, llmSvc *v
 	}
 
 	shmSizing := kvCacheShmSizing{}
+	var routingOnlyDeclaredBy string
 	for _, ref := range refs {
 		cfg, err := r.getConfig(ctx, llmSvc, ref.Name)
 		if err != nil {
@@ -762,6 +763,10 @@ func (r *LLMISVCReconciler) combineBaseRefsConfig(ctx context.Context, llmSvc *v
 				}
 			}
 			shmSizing.record(cfg, policy)
+			// An empty value reads as unset, so only a non-empty one names its config.
+			if cfg.Spec.Annotations[AnnotationModelBasedRoutingOnly] != "" {
+				routingOnlyDeclaredBy = "LLMInferenceServiceConfig " + cfg.Namespace + "/" + cfg.Name
+			}
 			appliedRefs = append(appliedRefs, v1alpha2.AppliedConfigRef{
 				Name:      gwapiv1.ObjectName(ref.Name),
 				Namespace: gwapiv1.Namespace(cfg.Namespace),
@@ -771,6 +776,11 @@ func (r *LLMISVCReconciler) combineBaseRefsConfig(ctx context.Context, llmSvc *v
 	}
 	shmSizing.record(&v1alpha2.LLMInferenceServiceConfig{Spec: llmSvc.Spec},
 		kvCacheShmPolicy{userDeclared: true, declaredBy: "the service spec"})
+	// The service spec merges last, so its own value wins.
+	if llmSvc.Spec.Annotations[AnnotationModelBasedRoutingOnly] != "" {
+		routingOnlyDeclaredBy = ""
+	}
+	reconcilerConfig.ModelBasedRoutingOnlyDeclaredBy = routingOnlyDeclaredBy
 	spec, err := MergeSpecs(ctx, append(specs, llmSvc.Spec)...)
 	if err != nil {
 		return nil, fmt.Errorf("failed to merge specs: %w", err)

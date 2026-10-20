@@ -301,6 +301,12 @@ var _ = Describe("Model Based Routing Only", func() {
 			g.Expect(&routes[0]).To(HaveHeaderMatch(headerName, publisherModel(testNs.Name, "facebook/opt-125m")))
 		}).WithContext(ctx).Should(Succeed())
 		expectPerModelPathsDropped(ctx, llmSvc, corev1.ConditionTrue, "SetOnService")
+
+		current := &v1alpha2.LLMInferenceService{}
+		Expect(envTest.Get(ctx, client.ObjectKeyFromObject(llmSvc), current)).To(Succeed())
+		Expect(current.Status.GetCondition(v1alpha2.PerModelPathsDropped).Message).To(
+			ContainSubstring("LLMInferenceServiceConfig "+testNs.Name+"/"+preset.Name),
+			"the message names the preset the merged spec no longer shows")
 	})
 
 	It("should keep a routing group's split when only one member is model-based routing only", func(ctx SpecContext) {
