@@ -125,9 +125,78 @@ sync-helm-common-helpers:
 spell-check: $(CODESPELL)
 	$(CODESPELL)
 
+# Tools the precommit graph runs, installed up front by precommit-prelude.
+PRECOMMIT_TOOLS = $(YQ) $(KUSTOMIZE) $(CONTROLLER_GEN) $(HELM_DOCS) $(GOLANGCI_LINT) $(SHELLCHECK) \
+	$(UV) $(RUFF) $(PYTEST) $(CODESPELL)
+
+# Targets precommit runs in parallel, longest chain first. vet is not among them:
+# golangci-lint's govet runs the same analyzers, and `make test` still runs vet.
+PRECOMMIT_TARGETS = generate manifests go-lint tidy \
+	ensure-go-version-upgrade py-fmt py-lint sh-lint e2e-collect uv-lock \
+	generate-quick-install-scripts generate-chart-manifests generate-chart-docs \
+	sync-helm-common-helpers sync-helm-common-resource-helpers sync-helm-multi-resource-helpers \
+	verify-pinned-actions verify-minimal-crd-sync boilerplate spell-check
+
+# PRECOMMIT_JOBS=1 runs the graph serially. Prefer it over `make -j1`, which make 3.81
+# does not pass on to the graph.
+PRECOMMIT_JOBS ?= $(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 1)
+
 # This runs all necessary steps to prepare for a commit.
-# vet is left out: golangci-lint's govet runs the same analyzers, and `make test` still runs vet.
-precommit: ensure-go-version-upgrade sync-deps sync-img-env go-lint py-fmt py-lint sh-lint e2e-collect generate tidy manifests uv-lock generate-quick-install-scripts generate-chart-manifests generate-chart-docs sync-helm-common-helpers sync-helm-common-resource-helpers sync-helm-multi-resource-helpers verify-pinned-actions verify-minimal-crd-sync boilerplate spell-check
+#
+# kserve-deps.env is included at parse time, so the tool versions and GIE_VERSION
+# that sync-deps writes are only seen by a make started after it. The prelude
+# installs tools one at a time: sync-deps rewrites kserve-deps.env, which re-runs
+# the venv tools' pip install, and concurrent pip installs into one venv are not
+# safe. pip leaves those tools older than kserve-deps.env, so the graph treats
+# them as up to date (-o) rather than reinstalling them in parallel. A -j or -O
+# from the calling make wins over PRECOMMIT_JOBS and --output-sync=target, so the
+# graph shares its jobserver.
+precommit: sync-deps
+	@$(MAKE) --no-print-directory PRECOMMIT_SUBMAKE=1 precommit-prelude
+	@$(MAKE) --no-print-directory PRECOMMIT_SUBMAKE=1 $(if $(filter -j%,$(MAKEFLAGS)),,-j$(PRECOMMIT_JOBS)) \
+		$(if $(filter -O%,$(MAKEFLAGS)),,$(if $(filter output-sync,$(.FEATURES)),--output-sync=target)) \
+		$(addprefix -o ,$(PRECOMMIT_TOOLS)) precommit-graph
+
+.PHONY: precommit-prelude precommit-graph
+precommit-prelude: sync-img-env $(PRECOMMIT_TOOLS)
+precommit-graph: $(PRECOMMIT_TARGETS)
+
+ifneq (,$(filter precommit-prelude,$(MAKECMDGOALS)))
+.NOTPARALLEL:
+endif
+
+# Ordering edges for the graph. They are declared only when it is the goal, so a
+# target run on its own keeps its usual behaviour.
+ifneq (,$(filter precommit-graph,$(MAKECMDGOALS)))
+ifeq (,$(PRECOMMIT_SUBMAKE))
+$(error precommit-graph relies on the tools precommit installs first; run make precommit)
+endif
+# Both truncate and rewrite Go under pkg/apis (gengo zz_generated.defaults.go,
+# controller-gen zz_generated.deepcopy.go) and fail to load it mid-write.
+manifests: | generate
+# golangci-lint type-checks the generated Go.
+go-lint: | generate manifests
+# go commands under GOFLAGS=-mod=mod add go.sum lines (golangci-lint adds about 530
+# on a cold cache); tidy has to run after them to drop those lines.
+tidy: | generate manifests go-lint
+# client-gen rewrites python/kserve, which ruff formats.
+py-fmt: | generate
+# These read or run Python that ruff format rewrites.
+py-lint e2e-collect validate-infra-scripts generate-quick-install-scripts: | py-fmt
+# Both pip install into bin/.venv.
+generate-quick-install-scripts: | e2e-collect
+# Both build config/** with kustomize; chart generation also helm-lints the synced helpers.
+generate-quick-install-scripts: | manifests
+generate-chart-manifests: | manifests sync-helm-common-helpers sync-helm-common-resource-helpers sync-helm-multi-resource-helpers
+# helm-docs reads the values.yaml files chart generation writes.
+generate-chart-docs: | generate-chart-manifests
+# Compares the CRD directories manifests writes.
+verify-minimal-crd-sync: | manifests
+# boilerplate adds headers to Go and Python files these targets write.
+boilerplate: | generate manifests go-lint py-fmt
+# codespell reads nearly every file, uv.lock included, so it runs last.
+spell-check: | $(filter-out spell-check,$(PRECOMMIT_TARGETS))
+endif
 
 # This is used by CI to ensure that the precommit checks are met.
 check: precommit

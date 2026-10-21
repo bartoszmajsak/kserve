@@ -29,8 +29,13 @@ ARCH ?=
 # CPU/Memory limits for controller-manager
 KSERVE_CONTROLLER_CPU_LIMIT ?= 100m
 KSERVE_CONTROLLER_MEMORY_LIMIT ?= 300Mi
+# precommit's sub-makes (PRECOMMIT_SUBMAKE=1) skip the rewrite: precommit already
+# wrote these limits, and rewriting the file at their parse time races with parallel
+# targets that read it through kustomize (chart and quick-install generation).
+ifeq (,$(PRECOMMIT_SUBMAKE))
 $(shell perl -pi -e 's/cpu:.*/cpu: $(KSERVE_CONTROLLER_CPU_LIMIT)/' config/default/manager_resources_patch.yaml)
 $(shell perl -pi -e 's/memory:.*/memory: $(KSERVE_CONTROLLER_MEMORY_LIMIT)/' config/default/manager_resources_patch.yaml)
+endif
 
 # Force the Go toolchain defined in go.mod.
 # When GOTOOLCHAIN=auto, the Go command may download a minimal toolchain to the
