@@ -18,8 +18,8 @@ generate-quick-install-scripts: validate-infra-scripts $(PYTHON_VENV)
 
 generate-chart-manifests:
 	@bash hack/setup/scripts/generate_chart_manifests.sh
-	make lint-helm-charts
-	make verify-helm-helpers-consistency
+	$(MAKE) lint-helm-charts
+	$(MAKE) verify-helm-helpers-consistency
 
 # Generate manifests e.g. CRD, RBAC etc.
 manifests: controller-gen kustomize yq
@@ -178,17 +178,22 @@ manifests: controller-gen kustomize yq
 	cp config/configmap/inferenceservice.yaml config/overlays/test/configmap/inferenceservice.yaml
 
 # Generate code
-generate: controller-gen helm-docs
-	@# Preserve existing copyright years across regeneration.
-	@grep -rn 'Copyright [0-9]\{4\} The KServe Authors' --include='*.go' --include='*.py' \
+generate: controller-gen
+	@# Preserve existing copyright years across regeneration. The cache is private
+	@# to this run so concurrent runs in other checkouts cannot overwrite it.
+	@set -e; years="$$(mktemp)"; trap 'rm -f "$$years"' EXIT; \
+	grep -rn 'Copyright [0-9]\{4\} The KServe Authors' --include='*.go' --include='*.py' \
 		pkg/ cmd/ python/ 2>/dev/null | \
 		sed -n 's/^\(.*\):[0-9]*:.*Copyright \([0-9]\{4\}\).*/\1\t\2/p' | \
-		sort -u > /tmp/copyright_years_cache
-	hack/update-codegen.sh
-	hack/update-openapigen.sh
-	COPYRIGHT_YEARS_CACHE=/tmp/copyright_years_cache hack/python-sdk/client-gen.sh
-	@python3 hack/setup/preserve-copyright-years.py /tmp/copyright_years_cache
-	@rm -f /tmp/copyright_years_cache
+		sort -u > "$$years"; \
+	hack/update-codegen.sh; \
+	hack/update-openapigen.sh; \
+	COPYRIGHT_YEARS_CACHE="$$years" hack/python-sdk/client-gen.sh; \
+	python3 hack/setup/preserve-copyright-years.py "$$years"
+
+# Chart READMEs, kept out of generate: helm-docs renders values.yaml, which
+# generate-chart-manifests writes.
+generate-chart-docs: helm-docs
 	$(HELM_DOCS) --chart-search-root=charts --output-file=README.md
 
 # Update uv.lock files
