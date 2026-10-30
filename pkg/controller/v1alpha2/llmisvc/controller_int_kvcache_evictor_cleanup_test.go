@@ -183,6 +183,61 @@ var _ = Describe("LLMInferenceService Controller - PVC evictor cleanup on deleti
 		expectNoEvictorLeft(ctx, testNs.Name)
 	})
 
+	It("should remove the shared evictor when its last user, on the shipped preset without baseRefs, never finished an evictor pass", func(ctx SpecContext) {
+		// given
+		testNs := NewTestNamespace(ctx, envTest)
+		createPVC(ctx, testNs.Name)
+
+		adopted := service("adopted", testNs.Name, withSharedPVCRef)
+		create(ctx, testNs, adopted)
+		evictor := sharedEvictor(ctx, testNs.Name)
+		Eventually(func(g Gomega, ctx context.Context) {
+			current := &v1alpha2.LLMInferenceService{}
+			g.Expect(envTest.Get(ctx, client.ObjectKeyFromObject(adopted), current)).To(Succeed())
+			g.Expect(current.Status.GetCondition(v1alpha2.PVCEvictorReady)).ToNot(BeNil())
+		}).WithContext(ctx).Should(Succeed())
+
+		// A Deployment under the workload's name that the service does not control fails
+		// each of its reconciles before the evictor pass, so it never stores
+		// PVCEvictorReady. Its spec has the pvc.ref tier, the shipped preset the container.
+		blocker := &appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{Name: "blocked-kserve", Namespace: testNs.Name},
+			Spec: appsv1.DeploymentSpec{
+				Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "blocker"}},
+				Template: corev1.PodTemplateSpec{
+					ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{"app": "blocker"}},
+					Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "blocker", Image: "registry.k8s.io/pause:3.10"}}},
+				},
+			},
+		}
+		Expect(envTest.Create(ctx, blocker)).To(Succeed())
+		DeferCleanup(func(ctx context.Context) { _ = envTest.Delete(ctx, blocker) })
+		blocked := service("blocked", testNs.Name, withSharedPVCRef)
+		create(ctx, testNs, blocked)
+		waitForFinalizer(ctx, blocked)
+		Eventually(func(g Gomega, ctx context.Context) {
+			current := &v1alpha2.LLMInferenceService{}
+			g.Expect(envTest.Get(ctx, client.ObjectKeyFromObject(blocked), current)).To(Succeed())
+			g.Expect(current.Status.GetCondition(v1alpha2.MainWorkloadReady)).To(HaveField("Reason", "ReconcileSingleNodeWorkloadError"))
+		}).WithContext(ctx).Should(Succeed())
+
+		// when
+		testNs.DeleteAndWait(ctx, adopted)
+
+		// then
+		// Peers resolve their merged spec, so blocked still counts as a user.
+		expectEvictorRunning(ctx, evictor)
+		current := &v1alpha2.LLMInferenceService{}
+		Expect(envTest.Get(ctx, client.ObjectKeyFromObject(blocked), current)).To(Succeed())
+		Expect(current.Status.GetCondition(v1alpha2.PVCEvictorReady)).To(BeNil())
+
+		// when
+		testNs.DeleteAndWait(ctx, blocked)
+
+		// then
+		expectNoEvictorLeft(ctx, testNs.Name)
+	})
+
 	It("should remove the shared evictor once the adopted and the legacy service on its PVC path are deleted", func(ctx SpecContext) {
 		// given
 		testNs := NewTestNamespace(ctx, envTest)
