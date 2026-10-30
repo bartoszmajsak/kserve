@@ -241,6 +241,10 @@ type CombinedConfig struct {
 	// ResolvedSchedulerConfigMap identifies the ConfigMap resolved from the
 	// scheduler's Config.Ref. Nil when no ConfigMap was referenced.
 	ResolvedSchedulerConfigMap *types.NamespacedName
+	// ResolvedLoRAAdapters are the LoRA adapters of the merged spec. They are
+	// returned rather than written into the Config, which callers reuse to resolve
+	// other services in the namespace.
+	ResolvedLoRAAdapters []resolvedLoRAAdapter
 }
 
 type routingSidecarArgsError struct{ error }
@@ -488,6 +492,7 @@ func (r *LLMISVCReconciler) reconcileBaseRefs(ctx context.Context, llmSvc *v1alp
 		llmSvc.MarkPresetsCombinedNotReady("CombineBaseError", "%s", conditionMessage(err))
 		return nil, fmt.Errorf("failed to combine base-configurations: %w", err)
 	}
+	config.ResolvedLoRAAdapters = result.ResolvedLoRAAdapters
 
 	// The LLMInferenceServiceConfig CRD's OpenAPI constraints are relaxed
 	// to allow Go templating. Validate the rendered spec through the
@@ -1035,19 +1040,19 @@ func (r *LLMISVCReconciler) combineBaseRefsConfig(ctx context.Context, llmSvc *v
 		llmSvcCfg.Spec.Router.Scheduler.Pool.Spec.EndpointPickerRef.Port = ptr.To(igwapi.Port{Number: 9002})
 	}
 
-	// Resolve LoRA adapters from the final merged spec and embed the result in reconcilerConfig.
-	// Doing this here ties resolution to the config-merge step so all downstream workload
-	// functions share a single, consistent resolution rather than each re-parsing the spec.
+	// Resolve LoRA adapters from the final merged spec. Doing this here ties resolution
+	// to the config-merge step so all downstream workload functions share a single,
+	// consistent resolution rather than each re-parsing the spec.
 	loraAdapters, err := enumerateLoRAAdapters(llmSvcCfg.Spec)
 	if err != nil {
 		return &CombinedConfig{Config: llmSvcCfg, AppliedConfigRefs: appliedRefs}, fmt.Errorf("failed to enumerate LoRA adapters: %w", err)
 	}
-	reconcilerConfig.ResolvedLoRAAdapters = loraAdapters
 
 	return &CombinedConfig{
 		Config:                     llmSvcCfg,
 		AppliedConfigRefs:          appliedRefs,
 		ResolvedSchedulerConfigMap: resolvedSchedulerConfigMap,
+		ResolvedLoRAAdapters:       loraAdapters,
 	}, nil
 }
 

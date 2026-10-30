@@ -181,9 +181,9 @@ type Config struct {
 	SchedulerConfig  *SchedulerConfig                `json:"-"`
 
 	// ResolvedLoRAAdapters holds the resolved LoRA adapter list derived from the final merged spec.
-	// Populated inside combineBaseRefsConfig (after all spec overlays and variable substitution)
-	// so that resolution is tied to the config-merge step and all downstream workload functions
-	// share a single consistent result.
+	// Set by reconcileBaseRefs from combineBaseRefsConfig's result (after all spec overlays and
+	// variable substitution) so that resolution is tied to the config-merge step and all
+	// downstream workload functions share a single consistent result.
 	ResolvedLoRAAdapters []resolvedLoRAAdapter `json:"-"`
 
 	// ModelExpress is the ModelExpress setup resolved for this reconcile, or nil

@@ -767,6 +767,68 @@ func TestReconcilePVCEvictorsContinuesWhenCleanupIsUnsafe(t *testing.T) {
 	}
 }
 
+// Peers are merged with the reconciling service's Config, which also carries what
+// was resolved for that service alone.
+func TestReconcilePVCEvictorsLeavesCallerConfigUnchanged(t *testing.T) {
+	evictorWorkload := func() v1alpha2.WorkloadSpec {
+		return v1alpha2.WorkloadSpec{
+			Template: &corev1.PodSpec{Containers: []corev1.Container{
+				{Name: mainContainerName, Env: []corev1.EnvVar{{Name: kvTransferArgsEnvVar}}},
+				{Name: pvcEvictorTemplateName},
+			}},
+			KVCacheOffloading: &v1alpha2.KVCacheOffloadingSpec{Secondary: []v1alpha2.SecondaryTierSpec{{FileSystem: &v1alpha2.FileSystemTierSpec{
+				PVC: &v1alpha2.PVCTierSpec{Ref: &v1alpha2.PVCRefTierSpec{Name: "shared-pvc", Path: "kv-cache"}},
+			}}}},
+		}
+	}
+	current := &v1alpha2.LLMInferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "current", Namespace: "test"},
+		Spec:       v1alpha2.LLMInferenceServiceSpec{WorkloadSpec: evictorWorkload()},
+	}
+	peer := &v1alpha2.LLMInferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "peer", Namespace: "test"},
+		Spec: v1alpha2.LLMInferenceServiceSpec{
+			Model:        loRASpec(t, "peer-adapter", "hf://org/peer-adapter").Model,
+			WorkloadSpec: evictorWorkload(),
+		},
+	}
+	pvc := &corev1.PersistentVolumeClaim{
+		ObjectMeta: metav1.ObjectMeta{Name: "shared-pvc", Namespace: "test"},
+		Spec:       corev1.PersistentVolumeClaimSpec{AccessModes: []corev1.PersistentVolumeAccessMode{corev1.ReadWriteMany}},
+	}
+	preset := loadPresetConfig(t, "config-llm-template.yaml")
+	preset.Namespace = constants.KServeNamespace
+
+	scheme := runtime.NewScheme()
+	for _, addToScheme := range []func(*runtime.Scheme) error{appsv1.AddToScheme, corev1.AddToScheme, v1alpha2.AddToScheme} {
+		if err := addToScheme(scheme); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(current, peer, preset).Build()
+	pvcReader := fake.NewClientBuilder().WithScheme(scheme).WithObjects(pvc).Build()
+	reconciler := &LLMISVCReconciler{Client: fakeClient, APIReader: pvcReader, EventRecorder: record.NewFakeRecorder(10)}
+
+	config := &Config{
+		ResolvedLoRAAdapters: []resolvedLoRAAdapter{{
+			name: "current-adapter", uri: "hf://org/current-adapter", scheme: constants.HfURIPrefix,
+			mountPath: "/mnt/lora/current-adapter",
+		}},
+		WorkloadRevision: "current-revision",
+	}
+	want := *config
+	if err := reconciler.reconcilePVCEvictors(t.Context(), current, config); err != nil {
+		t.Fatalf("reconcilePVCEvictors() error = %v", err)
+	}
+	if diff := cmp.Diff(want, *config, cmp.AllowUnexported(resolvedLoRAAdapter{})); diff != "" {
+		t.Fatalf("reconcilePVCEvictors() changed the caller's Config (-want +got):\n%s", diff)
+	}
+	// Both peer passes ran: the template agreement and the cleanup.
+	if got := current.Status.GetCondition(v1alpha2.PVCEvictorReady); got == nil {
+		t.Fatal("reconcilePVCEvictors() did not reach the evictor readiness")
+	}
+}
+
 func TestReconcilePVCEvictorsMarksReconcileError(t *testing.T) {
 	svc := &v1alpha2.LLMInferenceService{
 		ObjectMeta: metav1.ObjectMeta{Name: "current", Namespace: "test"},
