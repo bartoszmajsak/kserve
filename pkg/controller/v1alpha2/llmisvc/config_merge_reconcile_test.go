@@ -830,6 +830,51 @@ func TestReconcileBaseRefs_InvalidConfigClearsStaleReady(t *testing.T) {
 	assert.Contains(t, ready.Message, "spec.model.uri")
 }
 
+// The workload reads the adapters from the Config, so they must come from the
+// merged spec, here a baseRef's.
+func TestReconcileBaseRefs_ResolvesLoRAAdaptersIntoConfig(t *testing.T) {
+	scheme := runtime.NewScheme()
+	require.NoError(t, v1alpha2.AddToScheme(scheme))
+
+	llmSvc := &v1alpha2.LLMInferenceService{
+		ObjectMeta: metav1.ObjectMeta{Name: "test-llm", Namespace: "test-ns"},
+		Spec: v1alpha2.LLMInferenceServiceSpec{
+			Model:    v1alpha2.LLMModelSpec{Name: ptr.To("test-model")},
+			BaseRefs: []corev1.LocalObjectReference{{Name: "lora-config"}},
+		},
+	}
+	loraConfig := &v1alpha2.LLMInferenceServiceConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: "lora-config", Namespace: "test-ns"},
+		Spec:       loRASpec(t, "base-adapter", "hf://org/base-adapter"),
+	}
+	template := &v1alpha2.LLMInferenceServiceConfig{
+		ObjectMeta: metav1.ObjectMeta{Name: configTemplateName, Namespace: constants.KServeNamespace},
+	}
+	reconciler := &LLMISVCReconciler{
+		Client: fake.NewClientBuilder().
+			WithScheme(scheme).
+			WithObjects(loraConfig, template).
+			WithInterceptorFuncs(interceptor.Funcs{
+				Create: func(_ context.Context, _ client.WithWatch, _ client.Object, _ ...client.CreateOption) error {
+					return nil
+				},
+			}).
+			Build(),
+		EventRecorder: record.NewFakeRecorder(10),
+	}
+	config := &Config{}
+
+	_, err := reconciler.reconcileBaseRefs(t.Context(), llmSvc, config)
+
+	require.NoError(t, err)
+	assert.Equal(t, []resolvedLoRAAdapter{{
+		name:      "base-adapter",
+		mountPath: "/mnt/lora/base-adapter",
+		uri:       "hf://org/base-adapter",
+		scheme:    constants.HfURIPrefix,
+	}}, config.ResolvedLoRAAdapters)
+}
+
 func TestReconcileBaseRefs_DryRunTransientFailureRequeues(t *testing.T) {
 	scheme := runtime.NewScheme()
 	require.NoError(t, v1alpha2.AddToScheme(scheme))
