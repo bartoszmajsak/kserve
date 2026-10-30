@@ -127,10 +127,10 @@ var _ = Describe("LLMInferenceService Controller - PVC evictor cleanup on deleti
 		}).WithContext(ctx).Should(Succeed())
 	}
 
-	expectCleanupSkipped := func(ctx context.Context, llmSvc *v1alpha2.LLMInferenceService) {
+	expectCleanupSkipped := func(ctx context.Context, llmSvc *v1alpha2.LLMInferenceService, because string) {
 		GinkgoHelper()
 		Eventually(func(g Gomega, ctx context.Context) {
-			g.Expect(findEvent(ctx, envTest.Client, llmSvc, skippedReason)).ToNot(BeNil())
+			g.Expect(findEvent(ctx, envTest.Client, llmSvc, skippedReason)).To(HaveField("Message", ContainSubstring(" because "+because)))
 		}).WithContext(ctx).Should(Succeed())
 	}
 
@@ -169,7 +169,7 @@ var _ = Describe("LLMInferenceService Controller - PVC evictor cleanup on deleti
 		testNs.DeleteAndWait(ctx, adopted)
 
 		// then
-		expectCleanupSkipped(ctx, adopted)
+		expectCleanupSkipped(ctx, adopted, "other LLMInferenceServices in the namespace could not be resolved: unresolved.")
 		// Events are recorded in the order they are emitted, so with the later one in,
 		// one for typo would be too. Its cleanup ran and kept the evictor adopted used.
 		Expect(findEvent(ctx, envTest.Client, typo, skippedReason)).To(BeNil(), "typo's deletion skipped the cleanup")

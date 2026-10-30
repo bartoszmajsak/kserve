@@ -20,9 +20,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
+	"github.com/go-logr/logr/funcr"
 	"github.com/google/go-cmp/cmp"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -37,6 +40,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/client/interceptor"
 	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	"github.com/kserve/kserve/pkg/apis/serving/v1alpha2"
@@ -556,60 +560,125 @@ func TestFinalizePVCEvictorsCleansUpWhenBaseRefsCannotResolve(t *testing.T) {
 }
 
 func TestFinalizePVCEvictorsAllowsDeletionWhenCleanupIsUnsafe(t *testing.T) {
-	deletionTime := metav1.Now()
-	deleting := &v1alpha2.LLMInferenceService{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:              "deleting",
-			Namespace:         "test",
-			DeletionTimestamp: &deletionTime,
-			Finalizers:        []string{"test.finalizer"},
-		},
-		Spec: v1alpha2.LLMInferenceServiceSpec{WorkloadSpec: v1alpha2.WorkloadSpec{
-			KVCacheOffloading: &v1alpha2.KVCacheOffloadingSpec{
-				Secondary: []v1alpha2.SecondaryTierSpec{{FileSystem: &v1alpha2.FileSystemTierSpec{
-					PVC: &v1alpha2.PVCTierSpec{
-						Ref: &v1alpha2.PVCRefTierSpec{Name: "shared-pvc", Path: "kv-cache"},
-					},
-				}}},
-			},
-		}},
-	}
-	deleting.MarkPVCEvictorReady()
-	unresolved := &v1alpha2.LLMInferenceService{
-		ObjectMeta: metav1.ObjectMeta{Name: "unresolved", Namespace: "test"},
-		Spec: v1alpha2.LLMInferenceServiceSpec{
-			BaseRefs: []corev1.LocalObjectReference{{Name: "missing-config"}},
-		},
-	}
-	evictor := expectedPVCEvictorDeployment(deleting, pvcEvictorTarget{
-		claimName: "shared-pvc",
-		subPath:   "kv-cache",
-	})
-
-	scheme := runtime.NewScheme()
-	for _, addToScheme := range []func(*runtime.Scheme) error{
-		appsv1.AddToScheme,
-		corev1.AddToScheme,
-		v1alpha2.AddToScheme,
-	} {
-		if err := addToScheme(scheme); err != nil {
-			t.Fatal(err)
+	names := func(count int) []string {
+		out := make([]string, 0, count)
+		for i := range count {
+			out = append(out, fmt.Sprintf("unresolved-%c", 'a'+i))
 		}
+		return out
 	}
-	fakeClient := fake.NewClientBuilder().
-		WithScheme(scheme).
-		WithObjects(deleting, unresolved, evictor, testInferenceServiceConfigMap()).
-		Build()
-	recorder := record.NewFakeRecorder(1)
-	reconciler := &LLMISVCReconciler{Client: fakeClient, EventRecorder: recorder}
+	tests := []struct {
+		name       string
+		unresolved []string
+		wantReason string
+	}{
+		{
+			name:       "names every unresolved service",
+			unresolved: names(2),
+			wantReason: "because other LLMInferenceServices in the namespace could not be resolved: unresolved-a, unresolved-b.",
+		},
+		{
+			name:       "names all five",
+			unresolved: names(5),
+			wantReason: "because other LLMInferenceServices in the namespace could not be resolved: " +
+				"unresolved-a, unresolved-b, unresolved-c, unresolved-d, unresolved-e.",
+		},
+		{
+			// The log keeps the full list.
+			name:       "names the first five",
+			unresolved: names(7),
+			wantReason: "because other LLMInferenceServices in the namespace could not be resolved: " +
+				"unresolved-a, unresolved-b, unresolved-c, unresolved-d, unresolved-e and 2 more.",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			deletionTime := metav1.Now()
+			deleting := &v1alpha2.LLMInferenceService{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "deleting",
+					Namespace:         "test",
+					DeletionTimestamp: &deletionTime,
+					Finalizers:        []string{"test.finalizer"},
+				},
+				Spec: v1alpha2.LLMInferenceServiceSpec{WorkloadSpec: v1alpha2.WorkloadSpec{
+					KVCacheOffloading: &v1alpha2.KVCacheOffloadingSpec{
+						Secondary: []v1alpha2.SecondaryTierSpec{{FileSystem: &v1alpha2.FileSystemTierSpec{
+							PVC: &v1alpha2.PVCTierSpec{
+								Ref: &v1alpha2.PVCRefTierSpec{Name: "shared-pvc", Path: "kv-cache"},
+							},
+						}}},
+					},
+				}},
+			}
+			deleting.MarkPVCEvictorReady()
+			resolved := &v1alpha2.LLMInferenceService{ObjectMeta: metav1.ObjectMeta{Name: "resolved", Namespace: "test"}}
+			preset := loadPresetConfig(t, "config-llm-template.yaml")
+			preset.Namespace = constants.KServeNamespace
+			evictor := expectedPVCEvictorDeployment(deleting, pvcEvictorTarget{
+				claimName: "shared-pvc",
+				subPath:   "kv-cache",
+			})
+			objects := []client.Object{deleting, resolved, preset, evictor, testInferenceServiceConfigMap()}
+			for _, name := range tt.unresolved {
+				objects = append(objects, &v1alpha2.LLMInferenceService{
+					ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "test"},
+					Spec: v1alpha2.LLMInferenceServiceSpec{
+						BaseRefs: []corev1.LocalObjectReference{{Name: "missing-config"}},
+					},
+				})
+			}
 
-	if err := reconciler.finalizePVCEvictors(t.Context(), deleting); err != nil {
-		t.Fatalf("finalizePVCEvictors() error = %v, want deletion to continue", err)
+			scheme := runtime.NewScheme()
+			for _, addToScheme := range []func(*runtime.Scheme) error{
+				appsv1.AddToScheme,
+				corev1.AddToScheme,
+				v1alpha2.AddToScheme,
+			} {
+				if err := addToScheme(scheme); err != nil {
+					t.Fatal(err)
+				}
+			}
+			fakeClient := fake.NewClientBuilder().
+				WithScheme(scheme).
+				WithObjects(objects...).
+				// The cache lists in no particular order.
+				WithInterceptorFuncs(interceptor.Funcs{List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
+					if err := c.List(ctx, list, opts...); err != nil {
+						return err
+					}
+					if services, ok := list.(*v1alpha2.LLMInferenceServiceList); ok {
+						slices.Reverse(services.Items)
+					}
+					return nil
+				}}).
+				Build()
+			recorder := record.NewFakeRecorder(1)
+			reconciler := &LLMISVCReconciler{Client: fakeClient, EventRecorder: recorder}
+			var summary []string
+			ctx := log.IntoContext(t.Context(), funcr.New(func(_, args string) {
+				if strings.Contains(args, "one or more LLMInferenceServices could not be resolved") {
+					summary = append(summary, args)
+				}
+			}, funcr.Options{}))
+
+			if err := reconciler.finalizePVCEvictors(ctx, deleting); err != nil {
+				t.Fatalf("finalizePVCEvictors() error = %v, want deletion to continue", err)
+			}
+			if err := fakeClient.Get(t.Context(), client.ObjectKeyFromObject(evictor), &appsv1.Deployment{}); err != nil {
+				t.Fatalf("PVC evictor Deployment was removed while cleanup was unsafe: %v", err)
+			}
+			expectPVCEvictorCleanupSkippedEvent(t, recorder, tt.wantReason)
+			if len(summary) != 1 {
+				t.Fatalf("logged %d summaries of the unresolved services, want 1: %q", len(summary), summary)
+			}
+			for _, name := range tt.unresolved {
+				if !strings.Contains(summary[0], `"`+name+`"`) {
+					t.Fatalf("log %q does not list %q", summary[0], name)
+				}
+			}
+		})
 	}
-	if err := fakeClient.Get(t.Context(), client.ObjectKeyFromObject(evictor), &appsv1.Deployment{}); err != nil {
-		t.Fatalf("PVC evictor Deployment was removed while cleanup was unsafe: %v", err)
-	}
-	expectPVCEvictorCleanupSkippedEvent(t, recorder, "another LLMInferenceService in the namespace could not be resolved")
 }
 
 // llmTemplatePresetWithoutPVCEvictor is the shipped kserve-config-llm-template, in the

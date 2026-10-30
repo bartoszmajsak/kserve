@@ -69,7 +69,9 @@ const (
 )
 
 var (
-	errPVCEvictorCleanupUnsafe         = errors.New("PVC evictor cleanup is unsafe")
+	// Wrapped with the names of the unresolved services, and read as the reason of
+	// the PVCEvictorCleanupSkipped event.
+	errPVCEvictorCleanupUnsafe         = errors.New("other LLMInferenceServices in the namespace could not be resolved")
 	errPVCEvictorUnsupportedAccessMode = errors.New("unsupported PVC access mode")
 )
 
@@ -798,7 +800,7 @@ func (r *LLMISVCReconciler) finalizePVCEvictors(ctx context.Context, llmSvc *v1a
 	}
 	if err := r.cleanupUnusedPVCEvictors(ctx, llmSvc.Namespace, config, nil, llmSvc.Name); err != nil {
 		if errors.Is(err, errPVCEvictorCleanupUnsafe) {
-			r.skipPVCEvictorCleanup(ctx, llmSvc, "another LLMInferenceService in the namespace could not be resolved")
+			r.skipPVCEvictorCleanup(ctx, llmSvc, err.Error())
 			return nil
 		}
 		return err
@@ -1406,13 +1408,13 @@ func (r *LLMISVCReconciler) cleanupUnusedPVCEvictors(ctx context.Context, namesp
 }
 
 func (r *LLMISVCReconciler) cleanupUnusedPVCEvictorsWithResult(ctx context.Context, namespace string, config *Config, currentService *v1alpha2.LLMInferenceService, excludedService string) (map[string]struct{}, error) {
-	referenced, live, cleanupSafe, err := r.referencedPVCEvictorKeys(ctx, namespace, config, currentService, excludedService)
+	referenced, live, unresolved, err := r.referencedPVCEvictorKeys(ctx, namespace, config, currentService, excludedService)
 	if err != nil {
 		return nil, err
 	}
-	if !cleanupSafe {
-		log.FromContext(ctx).Info("Skipping PVC evictor cleanup because one or more LLMInferenceServices could not be resolved")
-		return nil, errPVCEvictorCleanupUnsafe
+	if len(unresolved) > 0 {
+		log.FromContext(ctx).Info("Skipping PVC evictor cleanup because one or more LLMInferenceServices could not be resolved", "llmSvcs", unresolved)
+		return nil, fmt.Errorf("%w: %s", errPVCEvictorCleanupUnsafe, firstPVCEvictorServiceNames(unresolved))
 	}
 
 	current := &appsv1.DeploymentList{}
@@ -1499,17 +1501,27 @@ func (r *LLMISVCReconciler) cleanupPVCEvictorServiceAccount(ctx context.Context,
 	return nil
 }
 
+// firstPVCEvictorServiceNames keeps the PVCEvictorCleanupSkipped message short in a
+// namespace with many unresolved services. The log line that reports them lists all.
+func firstPVCEvictorServiceNames(names []string) string {
+	const named = 5
+	if len(names) <= named {
+		return strings.Join(names, ", ")
+	}
+	return fmt.Sprintf("%s and %d more", strings.Join(names[:named], ", "), len(names)-named)
+}
+
 // referencedPVCEvictorKeys returns the keys of the evictors that live services render,
-// and the names of the services that aren't being deleted or excluded.
-func (r *LLMISVCReconciler) referencedPVCEvictorKeys(ctx context.Context, namespace string, config *Config, currentService *v1alpha2.LLMInferenceService, excludedService string) (referenced, live map[string]struct{}, cleanupSafe bool, err error) {
+// the names of the services that aren't being deleted or excluded, and the sorted names
+// of those whose merged spec could not be resolved.
+func (r *LLMISVCReconciler) referencedPVCEvictorKeys(ctx context.Context, namespace string, config *Config, currentService *v1alpha2.LLMInferenceService, excludedService string) (referenced, live map[string]struct{}, unresolved []string, err error) {
 	services := &v1alpha2.LLMInferenceServiceList{}
 	if err := r.List(ctx, services, client.InNamespace(namespace)); err != nil {
-		return nil, nil, false, fmt.Errorf("failed to list LLMInferenceServices for PVC evictor ownership: %w", err)
+		return nil, nil, nil, fmt.Errorf("failed to list LLMInferenceServices for PVC evictor ownership: %w", err)
 	}
 
 	referenced = make(map[string]struct{})
 	live = make(map[string]struct{})
-	cleanupSafe = true
 	logger := log.FromContext(ctx)
 	for i := range services.Items {
 		service := services.Items[i].DeepCopy()
@@ -1525,7 +1537,7 @@ func (r *LLMISVCReconciler) referencedPVCEvictorKeys(ctx context.Context, namesp
 		} else {
 			combined, err := r.combineBaseRefsConfig(ctx, service, config)
 			if err != nil {
-				cleanupSafe = false
+				unresolved = append(unresolved, service.Name)
 				logger.Error(err, "Could not resolve PVC evictor references; preserving existing evictors", "llmSvc", client.ObjectKeyFromObject(service))
 				continue
 			}
@@ -1541,7 +1553,8 @@ func (r *LLMISVCReconciler) referencedPVCEvictorKeys(ctx context.Context, namesp
 			referenced[pvcEvictorKey(target.claimName, target.subPath)] = struct{}{}
 		}
 	}
-	return referenced, live, cleanupSafe, nil
+	slices.Sort(unresolved)
+	return referenced, live, unresolved, nil
 }
 
 // hasRunningPVCEvictorConsumers reports whether a pod that hasn't finished, and names a
