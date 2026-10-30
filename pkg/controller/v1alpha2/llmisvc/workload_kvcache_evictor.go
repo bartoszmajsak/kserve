@@ -760,7 +760,11 @@ func (r *LLMISVCReconciler) finalizePVCEvictors(ctx context.Context, llmSvc *v1a
 		}
 		usedEvictor = hasPods
 	}
-	if !usedEvictor && len(llmSvc.Spec.BaseRefs) == 0 {
+	// The well-known presets add the pvc-evictor container to every service, so one
+	// deleted before its first evictor pass stored PVCEvictorReady is a user whenever
+	// its merged spec has a pvc.ref tier. Only its own spec or its baseRefs supply
+	// that tier, as the PVC watch also assumes, so other services skip the merge.
+	if !usedEvictor && len(llmSvc.Spec.BaseRefs) == 0 && len(collectPVCEvictorIdentities(llmSvc)) == 0 {
 		return nil
 	}
 	// Resolved with the configuration reconcile renders with: a preset can template

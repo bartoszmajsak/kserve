@@ -160,7 +160,8 @@ func TestFinalizePVCEvictorsSkipsConfigForUnrelatedDeletingService(t *testing.T)
 		}
 	}
 	fakeClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(deleting, evictor).Build()
-	reconciler := &LLMISVCReconciler{Client: fakeClient}
+	recorder := record.NewFakeRecorder(1)
+	reconciler := &LLMISVCReconciler{Client: fakeClient, EventRecorder: recorder}
 
 	if err := reconciler.finalizePVCEvictors(t.Context(), deleting); err != nil {
 		t.Fatalf("finalizePVCEvictors() error = %v, want nil", err)
@@ -168,18 +169,18 @@ func TestFinalizePVCEvictorsSkipsConfigForUnrelatedDeletingService(t *testing.T)
 	if err := fakeClient.Get(t.Context(), client.ObjectKeyFromObject(evictor), &appsv1.Deployment{}); err != nil {
 		t.Fatalf("unrelated PVC evictor Deployment was removed: %v", err)
 	}
+	// With neither a pvc.ref tier nor baseRefs it cannot use an evictor, so nothing is
+	// loaded or merged and a missing ConfigMap or preset cannot skip the cleanup.
+	if len(recorder.Events) != 0 {
+		t.Fatalf("finalizePVCEvictors() resolved a service without a pvc.ref tier or baseRefs: %s", <-recorder.Events)
+	}
 }
 
 func TestFinalizePVCEvictorsCleansDeploymentWithoutReadyStatus(t *testing.T) {
-	deletionTime := metav1.Now()
-	deleting := &v1alpha2.LLMInferenceService{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:              "deleting",
-			Namespace:         "test",
-			DeletionTimestamp: &deletionTime,
-			Finalizers:        []string{"test.finalizer"},
-		},
-		Spec: v1alpha2.LLMInferenceServiceSpec{BaseRefs: []corev1.LocalObjectReference{{Name: "evictor-base"}}},
+	pvcRefTier := func() *v1alpha2.KVCacheOffloadingSpec {
+		return &v1alpha2.KVCacheOffloadingSpec{Secondary: []v1alpha2.SecondaryTierSpec{{FileSystem: &v1alpha2.FileSystemTierSpec{
+			PVC: &v1alpha2.PVCTierSpec{Ref: &v1alpha2.PVCRefTierSpec{Name: "shared-pvc", Path: "kv-cache"}},
+		}}}}
 	}
 	baseConfig := &v1alpha2.LLMInferenceServiceConfig{
 		ObjectMeta: metav1.ObjectMeta{Name: "evictor-base", Namespace: "test"},
@@ -188,44 +189,81 @@ func TestFinalizePVCEvictorsCleansDeploymentWithoutReadyStatus(t *testing.T) {
 				{Name: mainContainerName, Env: []corev1.EnvVar{{Name: kvTransferArgsEnvVar}}},
 				{Name: pvcEvictorTemplateName},
 			}},
-			KVCacheOffloading: &v1alpha2.KVCacheOffloadingSpec{Secondary: []v1alpha2.SecondaryTierSpec{{FileSystem: &v1alpha2.FileSystemTierSpec{
-				PVC: &v1alpha2.PVCTierSpec{Ref: &v1alpha2.PVCRefTierSpec{Name: "shared-pvc", Path: "kv-cache"}},
-			}}}},
+			KVCacheOffloading: pvcRefTier(),
 		}},
 	}
-	evictor := expectedPVCEvictorDeployment(deleting, pvcEvictorTarget{
-		claimName: "shared-pvc", subPath: "kv-cache",
-		containerTemplate: &corev1.Container{Name: pvcEvictorTemplateName, Image: "example.com/evictor:preset"},
-	})
 
-	scheme := runtime.NewScheme()
-	for _, addToScheme := range []func(*runtime.Scheme) error{
-		appsv1.AddToScheme,
-		corev1.AddToScheme,
-		v1alpha2.AddToScheme,
-	} {
-		if err := addToScheme(scheme); err != nil {
-			t.Fatal(err)
-		}
+	tests := []struct {
+		name string
+		spec v1alpha2.LLMInferenceServiceSpec
+	}{
+		{
+			name: "pvc.ref tier and container from a baseRef",
+			spec: v1alpha2.LLMInferenceServiceSpec{BaseRefs: []corev1.LocalObjectReference{{Name: baseConfig.Name}}},
+		},
+		{
+			// Deleted before its first evictor pass stored PVCEvictorReady.
+			name: "pvc.ref tier in its own spec, container from the well-known preset",
+			spec: v1alpha2.LLMInferenceServiceSpec{WorkloadSpec: v1alpha2.WorkloadSpec{KVCacheOffloading: pvcRefTier()}},
+		},
 	}
-	fakeClient := fake.NewClientBuilder().WithScheme(scheme).
-		WithObjects(deleting, baseConfig, evictor, testInferenceServiceConfigMap(), func() *v1alpha2.LLMInferenceServiceConfig {
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			deletionTime := metav1.Now()
+			deleting := &v1alpha2.LLMInferenceService{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:              "deleting",
+					Namespace:         "test",
+					DeletionTimestamp: &deletionTime,
+					Finalizers:        []string{"test.finalizer"},
+				},
+				Spec: tt.spec,
+			}
+			evictor := expectedPVCEvictorDeployment(deleting, pvcEvictorTarget{
+				claimName: "shared-pvc", subPath: "kv-cache",
+				containerTemplate: &corev1.Container{Name: pvcEvictorTemplateName, Image: "example.com/evictor:preset"},
+			})
+			serviceAccount := &corev1.ServiceAccount{ObjectMeta: metav1.ObjectMeta{
+				Name:      pvcEvictorServiceAccount,
+				Namespace: "test",
+				Labels:    map[string]string{pvcEvictorLabel: "true"},
+			}}
 			preset := loadPresetConfig(t, "config-llm-template.yaml")
 			preset.Namespace = constants.KServeNamespace
-			return preset
-		}()).Build()
-	reconciler := &LLMISVCReconciler{Client: fakeClient}
 
-	stored := deleting.Spec.DeepCopy()
-	if err := reconciler.finalizePVCEvictors(t.Context(), deleting); err != nil {
-		t.Fatalf("finalizePVCEvictors() error = %v", err)
-	}
-	if err := fakeClient.Get(t.Context(), client.ObjectKeyFromObject(evictor), &appsv1.Deployment{}); err == nil {
-		t.Fatal("PVC evictor Deployment remains after finalization")
-	}
-	// Reconcile removes the finalizer by updating this object, so its spec must stay as stored.
-	if diff := cmp.Diff(*stored, deleting.Spec); diff != "" {
-		t.Fatalf("finalizePVCEvictors() changed the stored spec (-want +got):\n%s", diff)
+			scheme := runtime.NewScheme()
+			for _, addToScheme := range []func(*runtime.Scheme) error{
+				appsv1.AddToScheme,
+				corev1.AddToScheme,
+				v1alpha2.AddToScheme,
+			} {
+				if err := addToScheme(scheme); err != nil {
+					t.Fatal(err)
+				}
+			}
+			fakeClient := fake.NewClientBuilder().WithScheme(scheme).
+				WithObjects(deleting, baseConfig.DeepCopy(), preset, evictor, serviceAccount, testInferenceServiceConfigMap()).Build()
+			recorder := record.NewFakeRecorder(1)
+			reconciler := &LLMISVCReconciler{Client: fakeClient, EventRecorder: recorder}
+
+			stored := deleting.DeepCopy()
+			if err := reconciler.finalizePVCEvictors(t.Context(), deleting); err != nil {
+				t.Fatalf("finalizePVCEvictors() error = %v", err)
+			}
+			if err := fakeClient.Get(t.Context(), client.ObjectKeyFromObject(evictor), &appsv1.Deployment{}); err == nil {
+				t.Fatal("PVC evictor Deployment remains after finalization")
+			}
+			if err := fakeClient.Get(t.Context(), client.ObjectKeyFromObject(serviceAccount), &corev1.ServiceAccount{}); err == nil {
+				t.Fatal("PVC evictor ServiceAccount remains after finalization")
+			}
+			if len(recorder.Events) != 0 {
+				t.Fatalf("finalizePVCEvictors() skipped the cleanup: %s", <-recorder.Events)
+			}
+			// Reconcile removes the finalizer by updating this object, so it must stay as stored.
+			if diff := cmp.Diff(stored, deleting); diff != "" {
+				t.Fatalf("finalizePVCEvictors() changed the deleting service (-want +got):\n%s", diff)
+			}
+		})
 	}
 }
 
@@ -635,6 +673,9 @@ func TestFinalizePVCEvictorsIgnoresUnsafeCleanupForUnrelatedService(t *testing.T
 		claimName: "shared-pvc",
 		subPath:   "kv-cache",
 	})
+	// The pvc.ref tier alone does not make it a user: its preset predates the
+	// pvc-evictor container.
+	legacyPreset := llmTemplatePresetWithoutPVCEvictor(t)
 
 	scheme := runtime.NewScheme()
 	for _, addToScheme := range []func(*runtime.Scheme) error{
@@ -648,15 +689,19 @@ func TestFinalizePVCEvictorsIgnoresUnsafeCleanupForUnrelatedService(t *testing.T
 	}
 	fakeClient := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithObjects(deleting, unresolved, evictor, testInferenceServiceConfigMap()).
+		WithObjects(deleting, unresolved, evictor, legacyPreset, testInferenceServiceConfigMap()).
 		Build()
-	reconciler := &LLMISVCReconciler{Client: fakeClient}
+	recorder := record.NewFakeRecorder(1)
+	reconciler := &LLMISVCReconciler{Client: fakeClient, EventRecorder: recorder}
 
 	if err := reconciler.finalizePVCEvictors(t.Context(), deleting); err != nil {
 		t.Fatalf("finalizePVCEvictors() error = %v, want nil for unrelated service", err)
 	}
 	if err := fakeClient.Get(t.Context(), client.ObjectKeyFromObject(evictor), &appsv1.Deployment{}); err != nil {
 		t.Fatalf("PVC evictor Deployment was removed while cleanup was unsafe: %v", err)
+	}
+	if len(recorder.Events) != 0 {
+		t.Fatalf("finalizePVCEvictors() reported a skipped cleanup for a service that never used an evictor: %s", <-recorder.Events)
 	}
 }
 
